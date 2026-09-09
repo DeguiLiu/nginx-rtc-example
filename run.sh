@@ -47,7 +47,7 @@ detect_candidate_ip() {
 sync_deploy() {
     echo "[sync] nginx.conf + *.lua -> $ORX/conf/"
     echo "[sync] html/*            -> $ORX/html/"
-    mkdir -p "$ORX/conf" "$ORX/html"
+    mkdir -p "$ORX/conf" "$ORX/html" "$ORX/rec"
     cp -f "$NGX_CONF_SRC" "$ORX/conf/nginx.conf"
     cp -f "$DEPLOY/conf/"*.lua "$ORX/conf/"
     cp -f "$DEPLOY/html/"* "$ORX/html/"

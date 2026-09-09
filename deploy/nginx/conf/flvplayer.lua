@@ -14,6 +14,17 @@ local function esc(s)
     return s
 end
 
+-- Accept ?app=&stream=&key= so rtcplayer.html can fall back here with the
+-- same target prefilled, instead of resetting to the hardcoded defaults.
+local function arg(name, default)
+    local v = ngx.var["arg_" .. name]
+    if not v or v == "" then return default end
+    return v
+end
+local papp = arg("app", "live")
+local pstream = arg("stream", "livestream")
+local pkey = arg("key", "demo-secret-0123456789abcdef0123456789abcdef")
+
 local raw = ngx.shared.rtc_stats:get("stats")
 local opts = {}        -- 在线流 option 片段
 local streams = {}     -- 名字数组, 供 JS 前端直达
@@ -132,10 +143,10 @@ local page = [[<!DOCTYPE html>
     <div class="row"><label>在线流</label>
       <select id="liveSel" style="min-width:260px">]] .. opthtml .. [[</select>
     </div>
-    <div class="row"><label>应用</label><input type="text" id="app" value="live">
-      <label>流名</label><input type="text" id="stream" value="livestream">
+    <div class="row"><label>应用</label><input type="text" id="app" value="]] .. esc(papp) .. [[">
+      <label>流名</label><input type="text" id="stream" value="]] .. esc(pstream) .. [[">
     </div>
-    <div class="row"><label>密钥</label><input type="text" id="key" value="demo-secret-0123456789abcdef0123456789abcdef">
+    <div class="row"><label>密钥</label><input type="text" id="key" value="]] .. esc(pkey) .. [[">
       <button class="btn-play" id="btnPlay" onclick="play()">▶ 播放</button>
       <button class="btn-stop" id="btnStop" onclick="stop()" disabled>■ 停止</button>
       <span id="state"><span class="badge warn">未连接</span></span>

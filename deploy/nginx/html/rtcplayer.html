@@ -97,6 +97,9 @@ let t0 = 0;
 let statTimer = null;
 let serverTimer = null;
 let lastBytes = { video: 0, audio: 0, ts: 0 };
+let fallbackTimer = null;
+let fellBack = false;
+let curTarget = null;
 
 function log(msg) { el.log.textContent += new Date().toISOString().slice(11, 19) + " " + msg + "\n"; }
 function setState(txt, cls) { el.state.innerHTML = `<span class="badge ${cls}">${txt}</span>`; }
@@ -105,6 +108,22 @@ function pickHost() {
   const h = $("host").value.trim();
   if (h) return h;
   return location.hostname || "127.0.0.1";
+}
+
+// WebRTC unavailable -> jump to the HTTP-FLV player with the same target
+// prefilled (flvplayer.lua reads ?app=&stream=&key=). 600ms delay keeps the
+// failure state visible in the log before navigation.
+function fallback(reason) {
+  if (fellBack) return;
+  fellBack = true;
+  if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+  const t = curTarget || { app: "live", stream: "livestream", key: "" };
+  log("WebRTC 不可用(" + reason + ")，自动切换到 HTTP-FLV 播放器…");
+  setState("自动切换 HTTP-FLV…", "warn");
+  const q = "app=" + encodeURIComponent(t.app)
+          + "&stream=" + encodeURIComponent(t.stream)
+          + "&key=" + encodeURIComponent(t.key);
+  setTimeout(() => { location.href = "/flvplayer?" + q; }, 600);
 }
 
 function fmtMs(sec) { return sec == null ? "—" : (sec * 1000).toFixed(1) + " ms"; }
@@ -149,12 +168,13 @@ function wireEvents() {
     log(`[${Date.now()-t0}ms] connectionState=${s}`);
     setBadge("cConn", s);
     if (s === "connected") setState("已连接", "ok");
-    if (s === "failed") { setState("连接失败", "err"); stop(); }
+    if (s === "failed") { setState("连接失败", "err"); fallback("connectionState=failed"); }
   };
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
     log(`[${Date.now()-t0}ms] iceState=${s}`);
     setBadge("cIce", s);
+    if (s === "failed") fallback("iceConnectionState=failed");
   };
   pc.onsignalingstatechange = () => setBadge("cSig", pc.signalingState);
   pc.onicegatheringstatechange = () => setBadge("cGather", pc.iceGatheringState);
@@ -166,6 +186,9 @@ async function play() {
   const app = $("app").value.trim() || "live";
   const stream = $("stream").value.trim() || "livestream";
   const secret = $("key").value.trim() || "demo-secret-0123456789abcdef0123456789abcdef";
+  fellBack = false;
+  curTarget = { app, stream, key: secret };
+  fallbackTimer = setTimeout(() => fallback("超时未出图"), 10000);
   const api = `http://${host}:18082/rtc/v1/play/`;
   const streamurl = `webrtc://${host}:18082/${app}/${stream}`;
   log(`信令: POST ${api}`);
@@ -191,6 +214,7 @@ async function play() {
       const kind = ev.track.kind;
       const ms = Date.now() - t0;
       log(`[${ms}ms] onTrack: ${kind} ${ev.track.mimeType || ""}`);
+      if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
       setState("收到媒体流", "ok");
       if (kind === "video" && ev.streams[0]) {
         el.video.srcObject = ev.streams[0];
@@ -355,6 +379,7 @@ function renderServerStats(d) {
 function stop() {
   if (statTimer) { clearInterval(statTimer); statTimer = null; }
   if (serverTimer) { clearInterval(serverTimer); serverTimer = null; }
+  if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
   lastBytes = { video: 0, audio: 0, ts: 0 };
   if (pc) {
     try { pc.getSenders().forEach(s => s.track && s.track.stop()); pc.close(); } catch (e) {}

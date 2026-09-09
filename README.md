@@ -1,7 +1,8 @@
 # nginx-rtc-example — 自研 nginx-rtc-module 的部署示例(RTMP/WHIP → WebRTC 低延迟直播)
 
 自研 C 模块跑在 OpenResty/nginx 上，把 RTMP 或 WHIP 推流转成
-RTP/SRTP，通过 UDP 直出给浏览器 WebRTC 播放；同源同时支持 HTTP-FLV / HLS / DASH 多协议输出。
+RTP/SRTP，通过 UDP 直出给浏览器 WebRTC 播放；同源同时支持 HTTP-FLV / HLS / DASH 多协议输出，
+并把每条推流录制为 FLV 落盘。WebRTC 失败或超时会自动降级到 HTTP-FLV 播放器。
 架构一句话：`ffmpeg/WHIP 推流 → nginx(RTMP/HTTP) → 自研模块(bridge→媒体环/shm→SRTP/UDP) → 浏览器 WebRTC`。
 
 > **代码导航**：自研 C 源码在独立**公开仓 [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)**
@@ -88,6 +89,18 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx     # sync deploy 配置 +
 
 鉴权统一 HMAC token：`t`=过期秒，`sign`=base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`))；
 默认演示 secret `demo-secret-0123456789abcdef0123456789abcdef`，每流 secret 见 `deploy/nginx/conf/stream_keys.lua`。
+
+### 录制
+
+`application live` 内 `record all; record_path rec;` 把每条推流录制为 FLV，落盘到
+`<prefix>/rec/<stream>-<timestamp>.flv`（仅实际收流 worker 写，auto_push 副本跳过）。
+文件不通过 HTTP 暴露，运维直接从该目录拉取；`run.sh nginx` 会先 `mkdir -p` 该目录。
+
+### 播放器自动降级
+
+`rtcplayer.html` 在 WebRTC `connectionState`/`iceConnectionState` 进入 `failed`，或 10 秒内
+未收到媒体时，自动跳转到 `/flvplayer?app=&stream=&key=`（HTTP-FLV 播放器，同目标预填），
+保证弱网/连接失败时仍有可播放链路。
 
 ## 测试
 
