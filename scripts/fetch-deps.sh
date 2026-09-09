@@ -32,14 +32,21 @@ gitc() { # <url> <ref> <name>  -> shallow clone a pinned git ref into cache
 }
 
 # Self-developed C addon (public MIT) + http-flv (RTMP core the bridge links
-# against) + opus. Bump refs here when a dependency advances.
+# against). Bump refs here when a dependency advances.
 gitc https://github.com/DeguiLiu/nginx-rtc-module        v0.2.0 nginx-rtc-module
 gitc https://github.com/winshining/nginx-http-flv-module v1.2.14 nginx-http-flv-module
-gitc https://github.com/xiph/opus                         v1.3.1 opus
 
 # libsrtp (SRTP) + FFmpeg (aac decode subset) - git tags, no release tarballs
 gitc https://github.com/cisco/libsrtp v2.3.0 libsrtp
 gitc https://github.com/FFmpeg/FFmpeg n6.1   ffmpeg
+
+# Opus 1.3.1 - the xiph git tree ships only autogen.sh/configure.ac, so use the
+# official release tarball (which bundles the generated ./configure).
+OPUS_TAR="opus-1.3.1.tar.gz"
+if [ ! -s "$CACHE/$OPUS_TAR" ]; then
+    echo "[get ] $OPUS_TAR (downloads.xiph.org)"
+    curl -fsSL "https://downloads.xiph.org/releases/opus/$OPUS_TAR" -o "$CACHE/$OPUS_TAR"
+fi
 
 # OpenResty 1.31.1.1
 ORX_TAR="openresty-1.31.1.1.tar.gz"

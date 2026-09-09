@@ -17,10 +17,11 @@ THIRD="$BUILD/third"
 JOBS=${JOBS:-"$(nproc)"}
 mkdir -p "$CACHE" "$SRC" "$THIRD/include" "$THIRD/lib"
 
-echo "== 1/3 opus 1.3.1 (fetched) =="
-[ -d "$CACHE/opus/.git" ] || { echo "run scripts/fetch-deps.sh first"; exit 1; }
+echo "== 1/3 opus 1.3.1 (fetched tarball) =="
+[ -s "$CACHE/opus-1.3.1.tar.gz" ] || { echo "run scripts/fetch-deps.sh first"; exit 1; }
 rm -rf "$SRC/opus"
-cp -r "$CACHE/opus" "$SRC/opus"
+mkdir -p "$SRC/opus"
+tar -xzf "$CACHE/opus-1.3.1.tar.gz" -C "$SRC/opus" --strip-components=1
 ( cd "$SRC/opus" \
     && ./configure --disable-shared --enable-static --disable-doc --prefix="$THIRD" >/dev/null \
     && make -j"$JOBS" >/dev/null \
