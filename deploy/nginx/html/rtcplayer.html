@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebRTC 低延迟直播播放器</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; background: #f5f6fa; margin: 0; padding: 20px; color: #333; }
+  h1 { font-size: 20px; color: #1a73e8; margin: 0 0 4px; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 16px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  .card h2 { font-size: 14px; color: #1a73e8; margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  label { font-size: 13px; color: #555; min-width: 40px; }
+  input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+  input[type=text] { width: 160px; }
+  button { padding: 8px 18px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+  .btn-play { background: #1a73e8; color: #fff; }
+  .btn-stop { background: #e33; color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  video { width: 100%; max-width: 720px; background: #000; border-radius: 4px; }
+  .stat { font-size: 13px; line-height: 1.8; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; margin-left:6px; }
+  .ok { background:#e6f4ea; color:#137333; } .err { background:#fce8e6; color:#c5221f; }
+  .warn { background:#fef7e0; color:#b06000; }
+  .conn { display:flex; flex-wrap:wrap; gap:8px 16px; font-size:13px; }
+  .conn .item { color:#555; }
+  .metric { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed #eee; }
+  .metric .k { color:#777; }
+  .metric .v { font-variant-numeric: tabular-nums; color:#222; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { border:1px solid #eee; padding:5px 8px; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  #log { font-family: monospace; font-size: 12px; background: #1e1e1e; color: #7fdbca;
+         border-radius: 4px; padding: 10px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <h1>🎬 WebRTC 低延迟直播播放器</h1>
+  <div class="sub">RTMP → nginx 自研 RTC 模块 → WebRTC 浏览器播放 · 信令 /rtc/v1/play/ · ICE-lite · DTLS/SRTP</div>
+  <div style="margin:2px 0 12px">
+    <a href="/" style="color:#888;font-size:13px;margin-right:14px;text-decoration:none">◀ 门户</a>
+    <a href="/flvplayer" style="color:#e8710a;font-size:13px;text-decoration:none">切换 HTTP-FLV 播放器 (亚秒/秒开) ▶</a>
+  </div>
+
+  <div class="card">
+    <div class="row"><label>服务器</label>
+      <input type="text" id="host" placeholder="自动" title="本机 IP，如 172.16.48.122">
+      <span style="color:#888;font-size:12px">(留空自动取当前页面地址；跨机测试填 nginx 所在机器 IP)</span>
+    </div>
+    <div class="row"><label>应用</label><input type="text" id="app" value="live">
+      <label>流名</label><input type="text" id="stream" value="livestream">
+    </div>
+    <div class="row"><label>密钥</label><input type="text" id="key" value="demo-secret-0123456789abcdef0123456789abcdef">
+      <button class="btn-play" id="btnPlay" onclick="play()">▶ 播放</button>
+      <button class="btn-stop" id="btnStop" onclick="stop()" disabled>■ 停止</button>
+      <span id="state"><span class="badge warn">未连接</span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <video id="video" autoplay muted controls playsinline></video>
+  </div>
+
+  <div class="card">
+    <h2>连接状态</h2>
+    <div class="conn">
+      <span class="item">connection <span id="cConn" class="badge warn">new</span></span>
+      <span class="item">ice <span id="cIce" class="badge warn">new</span></span>
+      <span class="item">signaling <span id="cSig" class="badge warn">stable</span></span>
+      <span class="item">gathering <span id="cGather" class="badge warn">new</span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>客户端媒体统计（getStats）</h2>
+    <div class="stat" id="stats">等待播放…</div>
+  </div>
+
+  <div class="card">
+    <h2>服务端流统计（/rtc/v1/stats）</h2>
+    <div id="serverStats">等待数据…</div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+
+<script src="/hmac-sha256.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const el = { video: $("video"), state: $("state"), stats: $("stats"),
+             serverStats: $("serverStats"), log: $("log"),
+             btnPlay: $("btnPlay"), btnStop: $("btnStop") };
+let pc = null;
+let t0 = 0;
+let statTimer = null;
+let serverTimer = null;
+let lastBytes = { video: 0, audio: 0, ts: 0 };
+
+function log(msg) { el.log.textContent += new Date().toISOString().slice(11, 19) + " " + msg + "\n"; }
+function setState(txt, cls) { el.state.innerHTML = `<span class="badge ${cls}">${txt}</span>`; }
+
+function pickHost() {
+  const h = $("host").value.trim();
+  if (h) return h;
+  return location.hostname || "127.0.0.1";
+}
+
+function fmtMs(sec) { return sec == null ? "—" : (sec * 1000).toFixed(1) + " ms"; }
+function fmtPct(x) { return x == null ? "—" : x.toFixed(1) + "%"; }
+function fmtKbps(bps) { return bps == null ? "—" : (bps / 1024).toFixed(1) + " kbps"; }
+function badgeCls(state) {
+  if (!state || state === "new" || state === "checking" || state === "disconnected") return "warn";
+  if (state === "connected" || state === "completed") return "ok";
+  return "err";
+}
+function setBadge(id, state) {
+  const b = $(id);
+  b.textContent = state || "—";
+  b.className = "badge " + badgeCls(state);
+}
+
+// 优先协商 H264 + Opus（其余 codec 不选）
+function preferCodecs(pc) {
+  if (typeof RTCRtpSender === "undefined" || !RTCRtpSender.getCapabilities) return;
+  const setPref = (trans, kind, want) => {
+    const caps = RTCRtpSender.getCapabilities(kind);
+    if (!caps || !caps.codecs) return;
+    const prefs = caps.codecs.filter(c => {
+      const m = c.mimeType.toLowerCase();
+      return m === want.toLowerCase() || (m === "video/rtx" && want.toLowerCase().startsWith("video/"));
+    });
+    if (prefs.length && trans.setCodecPreferences) {
+      try { trans.setCodecPreferences(prefs); } catch (e) { log("codec pref: " + e); }
+    }
+  };
+  pc.getTransceivers().forEach(tr => {
+    if (tr.receiver && tr.receiver.track) {
+      if (tr.receiver.track.kind === "video") setPref(tr, "video", "video/H264");
+      else if (tr.receiver.track.kind === "audio") setPref(tr, "audio", "audio/opus");
+    }
+  });
+}
+
+function wireEvents() {
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    log(`[${Date.now()-t0}ms] connectionState=${s}`);
+    setBadge("cConn", s);
+    if (s === "connected") setState("已连接", "ok");
+    if (s === "failed") { setState("连接失败", "err"); stop(); }
+  };
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    log(`[${Date.now()-t0}ms] iceState=${s}`);
+    setBadge("cIce", s);
+  };
+  pc.onsignalingstatechange = () => setBadge("cSig", pc.signalingState);
+  pc.onicegatheringstatechange = () => setBadge("cGather", pc.iceGatheringState);
+}
+
+async function play() {
+  stop();
+  const host = pickHost();
+  const app = $("app").value.trim() || "live";
+  const stream = $("stream").value.trim() || "livestream";
+  const secret = $("key").value.trim() || "demo-secret-0123456789abcdef0123456789abcdef";
+  const api = `http://${host}:18082/rtc/v1/play/`;
+  const streamurl = `webrtc://${host}:18082/${app}/${stream}`;
+  log(`信令: POST ${api}`);
+  log(`流: ${streamurl}`);
+
+  // HMAC token: t=过期(秒), sign=base64url(HMAC-SHA256(app/stream|t=t))
+  // 用本地 hmac-sha256.js(纯 JS), 局域网 http 下也能签, 不依赖 WebCrypto。
+  const signToken = (sec, appname, streamname, ttl) => {
+    const t = Math.floor(Date.now() / 1000) + ttl;
+    const msg = `${appname}/${streamname}|t=${t}`;
+    return { t, sign: window.hmacSha256Base64url(sec, msg) };
+  };
+
+  try {
+    pc = new RTCPeerConnection();
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    preferCodecs(pc);
+    wireEvents();
+
+    t0 = Date.now();
+    pc.ontrack = ev => {
+      const kind = ev.track.kind;
+      const ms = Date.now() - t0;
+      log(`[${ms}ms] onTrack: ${kind} ${ev.track.mimeType || ""}`);
+      setState("收到媒体流", "ok");
+      if (kind === "video" && ev.streams[0]) {
+        el.video.srcObject = ev.streams[0];
+        el.video.play().catch(e => log("play(): " + e));
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // 等待本地候选收集完成（最多 2s），使 offer 含 host 候选
+    await new Promise(res => {
+      if (pc.iceGatheringState === "complete") return res();
+      const t = setTimeout(res, 2000);
+      pc.addEventListener("icegatheringstatechange", () => {
+        if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); }
+      });
+    });
+
+    el.btnPlay.disabled = true; el.btnStop.disabled = false;
+    setState("信令协商中…", "warn");
+
+    const tk = signToken(secret, app, stream, 3600);
+    const res = await fetch(api, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, clientip: host, t: String(tk.t), sign: tk.sign }),
+    });
+    const data = await res.json();
+    if (data.code !== 0) { log("信令错误: " + JSON.stringify(data)); setState("信令失败 code=" + data.code, "err"); stop(); return; }
+    log(`[${Date.now()-t0}ms] 收到 answer SDP`);
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+
+    startStats();
+    startServerStats(host);
+  } catch (e) {
+    log("异常: " + e.message);
+    setState("出错", "err");
+    stop();
+  }
+}
+
+function collectStats(stats) {
+  const codecs = {};
+  const out = { video: {}, audio: {}, rtt: null, codecVideo: "", codecAudio: "" };
+  stats.forEach(s => { if (s.type === "codec") codecs[s.id] = s.mimeType || ""; });
+  stats.forEach(s => {
+    if (s.type === "candidate-pair" && (s.state === "succeeded" || s.nominated)) {
+      if (s.currentRoundTripTime != null) out.rtt = s.currentRoundTripTime;
+    }
+    if (s.type === "remote-inbound-rtp" && out.rtt == null && s.roundTripTime != null) {
+      out.rtt = s.roundTripTime;
+    }
+    if (s.type === "inbound-rtp" && s.mediaType) {
+      const k = out[s.mediaType];
+      k.packets = s.packetsReceived || 0;
+      k.bytes = s.bytesReceived || 0;
+      k.lost = s.packetsLost || 0;
+      k.jitter = s.jitter;
+      if (s.mediaType === "video") {
+        k.frames = s.framesDecoded || 0;
+        k.key = s.keyFramesDecoded || 0;
+        k.fps = s.framesPerSecond;
+        k.width = s.frameWidth;
+        k.height = s.frameHeight;
+        k.nack = s.nackCount || 0;
+        k.pli = s.pliCount || 0;
+        out.codecVideo = codecs[s.codecId] || "";
+      } else {
+        out.codecAudio = codecs[s.codecId] || "";
+      }
+    }
+  });
+  return out;
+}
+
+function startStats() {
+  if (statTimer) clearInterval(statTimer);
+  statTimer = setInterval(async () => {
+    if (!pc) { clearInterval(statTimer); return; }
+    try {
+      const st = collectStats(await pc.getStats());
+      const now = Date.now();
+      const vBps = lastBytes.ts ? (st.video.bytes - lastBytes.video) * 8 / ((now - lastBytes.ts) / 1000) : 0;
+      const aBps = lastBytes.ts ? (st.audio.bytes - lastBytes.audio) * 8 / ((now - lastBytes.ts) / 1000) : 0;
+      lastBytes = { video: st.video.bytes, audio: st.audio.bytes, ts: now };
+
+      const ms = now - t0;
+      const vLoss = st.video.packets + st.video.lost > 0
+        ? st.video.lost / (st.video.packets + st.video.lost) * 100 : 0;
+      const aLoss = st.audio.packets + st.audio.lost > 0
+        ? st.audio.lost / (st.audio.packets + st.audio.lost) * 100 : 0;
+
+      const rows = [];
+      rows.push(m("已运行", (ms / 1000).toFixed(1) + " s"));
+      rows.push(m("RTT", fmtMs(st.rtt)));
+      rows.push(m("单向时延(≈RTT/2)", fmtMs(st.rtt == null ? null : st.rtt / 2)));
+      rows.push(m("视频分辨率", st.video.width && st.video.height ? st.video.width + "×" + st.video.height : "—"));
+      rows.push(m("视频帧率", st.video.fps != null ? st.video.fps.toFixed(1) + " fps" : "—"));
+      rows.push(m("视频码率", fmtKbps(vBps)));
+      rows.push(m("视频丢包", st.video.lost + " / " + fmtPct(vLoss)));
+      rows.push(m("视频抖动", fmtMs(st.video.jitter)));
+      rows.push(m("视频解码/关键帧", st.video.frames + " / " + st.video.key));
+      rows.push(m("视频 NACK/PLI", st.video.nack + " / " + st.video.pli));
+      rows.push(m("视频编码", st.codecVideo || "—"));
+      rows.push(m("音频码率", fmtKbps(aBps)));
+      rows.push(m("音频丢包", st.audio.lost + " / " + fmtPct(aLoss)));
+      rows.push(m("音频抖动", fmtMs(st.audio.jitter)));
+      rows.push(m("音频编码", st.codecAudio || "—"));
+      rows.push(m("出图", st.video.frames > 0 ? "✓ 已解码" : "等待视频解码…"));
+
+      el.stats.innerHTML = rows.join("");
+    } catch (e) { /* getStats 快照变化忽略 */ }
+  }, 1000);
+}
+
+function m(k, v) { return `<div class="metric"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+
+function startServerStats(host) {
+  if (serverTimer) clearInterval(serverTimer);
+  const url = `http://${host}:18082/rtc/v1/stats`;
+  const tick = async () => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("http " + res.status);
+      const data = await res.json();
+      renderServerStats(data);
+    } catch (e) {
+      el.serverStats.innerHTML = `<div class="stat">服务端统计不可用（loopback 限制或未启动）：${e.message}</div>`;
+    }
+  };
+  tick();
+  serverTimer = setInterval(tick, 2000);
+}
+
+function renderServerStats(d) {
+  if (!d || !Array.isArray(d.streams) || !d.streams.length) {
+    el.serverStats.innerHTML = `<div class="stat">暂无活动流。</div>`;
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>流</th><th>发布</th><th>观众</th>
+    <th>会话 TWCC(丢/收)</th>
+    <th>视频SSRC</th><th>PT</th><th>包</th><th>字节</th>
+    <th>音频SSRC</th><th>PT</th><th>包</th><th>字节</th>
+  </tr></thead><tbody>`;
+  d.streams.forEach(s => {
+    const sess = (s.sessions || []).map(x =>
+      `#${x.id} ${x.twcc_lost}/${x.twcc_received}`).join(" ");
+    html += `<tr>
+      <td>${s.name}</td><td>${s.publishing ? "是" : "否"}</td><td>${s.clients}</td>
+      <td>${sess || "—"}</td>
+      <td>${s.video.ssrc}</td><td>${s.video.pt}</td><td>${s.video.packets}</td><td>${s.video.octets}</td>
+      <td>${s.audio.ssrc}</td><td>${s.audio.pt}</td><td>${s.audio.packets}</td><td>${s.audio.octets}</td>
+    </tr>`;
+  });
+  html += `</tbody></table>`;
+  html += `<div class="stat">流总数 ${d.total_streams} · 观众总数 ${d.total_clients} · ` +
+          `视频字节 ${d.total_video_octets} · 音频字节 ${d.total_audio_octets}</div>`;
+  el.serverStats.innerHTML = html;
+}
+
+function stop() {
+  if (statTimer) { clearInterval(statTimer); statTimer = null; }
+  if (serverTimer) { clearInterval(serverTimer); serverTimer = null; }
+  lastBytes = { video: 0, audio: 0, ts: 0 };
+  if (pc) {
+    try { pc.getSenders().forEach(s => s.track && s.track.stop()); pc.close(); } catch (e) {}
+    pc = null;
+  }
+  el.video.srcObject = null;
+  el.btnPlay.disabled = false; el.btnStop.disabled = true;
+  setState("已停止", "warn");
+  setBadge("cConn", "closed");
+  setBadge("cIce", "closed");
+  setBadge("cSig", "closed");
+  setBadge("cGather", "complete");
+}
+</script>
+</body>
+</html>

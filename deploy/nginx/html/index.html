@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>直播播放门户</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; background: #f5f6fa; margin: 0;
+           min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .wrap { text-align: center; }
+    h1 { color: #1a73e8; font-size: 24px; margin-bottom: 6px; }
+    .sub { color: #888; font-size: 13px; margin-bottom: 30px; }
+    .cards { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+    a.card { display: block; width: 220px; padding: 26px 20px; background: #fff; color: #333;
+             text-decoration: none; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,.08);
+             transition: transform .12s ease, box-shadow .12s ease; }
+    a.card:hover { transform: translateY(-3px); box-shadow: 0 6px 16px rgba(0,0,0,.14); }
+    a.card .t { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    a.card .d { font-size: 12px; color: #888; line-height: 1.7; }
+    a.rtc .t { color: #1a73e8; } a.rtc .tag { color: #1a73e8; }
+    a.flv .t { color: #e8710a; } a.flv .tag { color: #e8710a; }
+    .tag { display: inline-block; font-size: 11px; border: 1px solid currentColor;
+           border-radius: 8px; padding: 1px 8px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>低延迟直播播放门户</h1>
+    <div class="sub">RTMP 推流 → nginx 自研 RTC / nginx-http-flv → 选择播放方式</div>
+    <div class="cards">
+      <a class="card rtc" href="/rtcplayer.html">
+        <div class="t">🎬 WebRTC 播放器</div>
+        <div class="d">信令 /rtc/v1/play/ · DTLS/SRTP 传输<br>延迟 <b>&lt; 1s</b>，适合互动直播</div>
+        <div class="tag">低延迟 · ICE-lite</div>
+      </a>
+      <a class="card flv" href="/flvplayer">
+        <div class="t">📺 HTTP-FLV 播放器</div>
+        <div class="d">nginx-http-flv 输出 · flv.js 播放<br>秒开 + GOP cache，兼容性最好</div>
+        <div class="tag">亚秒 · MSE</div>
+      </a>
+    </div>
+  </div>
+</body>
+</html>

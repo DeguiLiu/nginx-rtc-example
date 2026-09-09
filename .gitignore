@@ -1,0 +1,19 @@
+# Build outputs & caches
+build/
+scripts/_cache/
+*.o
+*.a
+*.so
+*.so.*
+
+# Test artifacts
+module/test/build/
+module/test/run_tests
+module/test/*.d
+
+# Runtime / logs / generated config
+*.log
+*.rtc.conf
+html/hls/
+html/dash/
+.DS_Store
