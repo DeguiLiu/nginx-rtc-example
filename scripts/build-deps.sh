@@ -32,7 +32,7 @@ echo "== 2/3 libsrtp 2.3.0 (fetched) =="
 rm -rf "$SRC/libsrtp"
 cp -r "$CACHE/libsrtp" "$SRC/libsrtp"
 ( cd "$SRC/libsrtp" \
-    && ./configure --disable-shared --enable-static --prefix="$THIRD" >/dev/null \
+    && CFLAGS="-fcommon" ./configure --prefix="$THIRD" >/dev/null \
     && make -j"$JOBS" >/dev/null \
     && make install >/dev/null )
 
