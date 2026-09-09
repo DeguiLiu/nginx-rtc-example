@@ -74,7 +74,7 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx     # sync deploy 配置 +
 ./run.sh stop
 ```
 
-实例前缀解析顺序：`OPENRESTY_PREFIX` env → `build/nginx` → `../openresty-rtmp-new/nginx`(与现网共存)。
+实例前缀解析：`OPENRESTY_PREFIX` env → `build/nginx`；均缺失则报错退出(提示先跑 `scripts/setup.sh`)。
 `run.sh` 的 `nginx|start` 会先 `sync`：把 `deploy/nginx/{conf,html}` 拷入前缀并生成
 `conf/nginx.rtc.conf`(候选 IP 自动探测或 `RTC_CANDIDATE_IP` 覆盖)。
 

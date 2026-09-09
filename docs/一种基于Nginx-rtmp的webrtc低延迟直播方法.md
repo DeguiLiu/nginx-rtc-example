@@ -1,47 +1,16 @@
-# 一种基于Nginx-rtmp的WebRTC低延迟直播方法
+# 在 Nginx 里做 WebRTC 低延迟直播：从方案到落地
 
-> 交底书模板
+> 本文源自技术交底书《一种基于 Nginx-rtmp 的 webrtc 低延迟直播方法》，结合本仓库 `ngx-rtc-module` 的实际实现整理而成。
 >
-> - 公司名称：中科睿芯
-> - 发明创造名称：一种基于Nginx-rtmp的webrtc低延迟直播方法
-> - 技术联系人：刘德贵
-> - 联系电话：13013803917
-> - E-mail：liudegui@smart-core.cn
+> 结论先行：**不引入 SRS 这类独立 RTC 服务，在 nginx 框架内直接完成 RTMP→WebRTC 转换**，延迟从 RTMP/HLS 的 1~10 秒降到 0.5 秒以内；端到端实测首包约 560 ms，视频 H264 761 包 / 362 KB、音频 Opus 389 包 / 67 KB 全链路可达。
 
-## 1 相关技术背景（背景技术），与本发明最相近似的现有实现方案（现有技术）
+## 1 为什么延迟降不下来
 
-### 1.1 背景技术
+直播分发最常见的组合是 Nginx-rtmp 模块（支持 RTMP、HLS）和它的扩展 Nginx-http-flv-module。三者都绕不开一个前提：码流走 TCP。
 
-Nginx同Apache、Tomcat一样，是一种开源服务器软件。它是一个高性能的HTTP和反向代理服务器，有着高并发、性能好和占用内存少等特点。
+RTMP 是 Adobe 为 Flash 平台设计的应用层协议，靠 TCP 保证可靠传输，局域网内延迟一般在 1~3 秒；主流浏览器早已放弃 Flash，iOS 端还需要第三方解码器。HLS 走 HTTP/80，穿透防火墙没问题，但服务端要把流切成 ts 小文件、客户端按序播放，延迟普遍在 10 秒以上，还会产生海量小文件。Http-Flv 把 RTMP 码流重新封装成 HTTP 长连接流，浏览器免插件就能播，实时性与 RTMP 相当——本质上仍是 TCP，1~3 秒的瓶颈没有解决，且客户端本地会缓存流媒体资源，保密性差。
 
-Nginx-rtmp模块是Nginx的一个著名的第三方开源模块，广泛应用于直播系统中。Nginx-rtmp-module包含以下特性：
-
-- 支持Rtmp、HLS直播；
-- 可将直播视频分段存储；
-- 支持 H.264 视频编解码、AAC 音频编解码；
-- 具有强大的缓冲功能，可确保在效率与码率间达到平衡；
-- 支持多种操作系统。
-
-Nginx-http-flv-module是在Nginx-rtmp-module基础上开发的一个直播模块：
-
-- 兼容Nginx-rtmp-module所有功能，基于[Nginx-rtmp-module](https://github.com/arut/nginx-rtmp-module)的流媒体服务器；
-- 支持Http-Flv 方式的直播；
-- 支持GOP缓存，以减少首屏时间。
-
-Rtmp协议是应用层协议，是为了在Adobe flash平台技术之间高性能传输音频、视频和数据而设计的，靠底层可靠的传输层协议（通常是TCP）来保证信息传输的可靠性的。Rtmp 是专为流媒体开发的协议，基本上所有的编码器都支持 Rtmp 输出。
-
-Http-Flv 依靠 MIME 的特性，根据协议中的 Content-Type 来选择相应的程序去处理相应的内容，使得流媒体可以通过 HTTP 传输。相较于 Rtmp 协议，Http-Flv 能够好的穿透防火墙，它是基于 HTTP/80 传输，有效避免被防火墙拦截；能够兼容支持 Android、iOS 的移动端。
-
-WebRtc是一个开源项目，旨在创建简单、标准化的流程通过Web提供实时通信（RTC）。它是基于UDP面向无连接的，可避免TCP做网络质量控制所需要的开销，能够做到比较低的延迟。WebRtc的特点：
-
-- 基于浏览器，不需要安装插件，只要调用就可以实现音视频互动；
-- 被纳入了HTML5标准，主流浏览器全面支持WebRtc。
-
-### 1.2 与本发明相关的现有技术一
-
-#### 1.2.1 现有技术一的技术方案
-
-[Nginx-rtmp](https://github.com/arut/nginx-rtmp-module)是应用广泛的直播系统，Rtmp协议是基于TCP协议，逻辑结构本质上和普通的TCP服务器类似。
+三条典型链路如下：
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -51,9 +20,9 @@ flowchart LR
     pc["PC 播放客户端"]
     mobile["移动播放客户端"]
 
-    push -- "Rtmp" --> server
-    server -- "Rtmp" --> pc
-    server -- "HLS" --> mobile
+    push -- "Rtmp（TCP，1-3s）" --> server
+    server -- "Rtmp（TCP）" --> pc
+    server -- "HLS（延迟 10s+）" --> mobile
 
     style push fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     style server fill:#fef3c7,stroke:#d97706,color:#78350f
@@ -61,35 +30,7 @@ flowchart LR
     style mobile fill:#dcfce7,stroke:#16a34a,color:#14532d
 ```
 
-图1
-
-如图1，Nginx-rtmp模块主要支持Rtmp和HLS直播：
-
-1. Rtmp：Rtmp 是专为流媒体开发的协议，在局域网环境下延时一般在 1-3s 之间，且需要使用Rtmp客户端播放；
-2. HLS：相对于Rtmp，HLS并不是一下请求完整的数据流，而是在服务器端将流媒体数据切割成连续的时长较短的ts小文件；播放客户端只要不停的按序播放从服务器获取到的文件，从而实现播放音视频，主要特点如下：
-   - 能够兼容支持 Android、iOS 的移动端；
-   - 基于 HTTP/80 传输，有效避免防火墙拦截；
-   - 延迟一般在10秒以上。
-
-#### 1.2.2 现有技术一的缺点
-
-使用Nginx-rtmp模块的Rtmp和HLS缺点分别如下：
-
-1. 播放Rtmp码流的劣势：
-   - 它是基于 TCP 传输，非公共端口，可能会被防火墙阻拦；
-   - Rtmp 为 Adobe 私有协议，很多设备无法播放，特别是在iOS端，需要使用第三方解码器才能播放；
-   - 目前主流浏览器已经不支持flash播放器；
-   - 延迟1-3秒对于实时性要求比较高的场景仍然达不到要求；
-2. 播放HLS码流的劣势：
-   - 实时性差，延迟高；
-   - ts 切片会造成海量小文件，对存储和缓存都有一定的挑战；
-   - 由于在本地客户端存在流媒体资源缓存，在保密性方面不够好。
-
-### 1.3 与本发明相关的现有技术二
-
-#### 1.3.1 现有技术二的技术方案
-
-Nginx-http-flv-module是在Nginx-rtmp-module基础上开发的一个直播模块，增加了对Http-Flv方式的直播支持；使用类似 Rtmp流式的 HTTP 长连接，可以复用现有 HTTP 分发资源的流式协议。使得浏览器无需Flash播放插件就能播放流媒体码流。将Rtmp转为Http-Flv，浏览器拉取是HTTP类型的流，不再是Rtmp格式。
+图 1：现有技术一，Nginx-rtmp 的 RTMP/HLS 分发
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -99,39 +40,20 @@ flowchart LR
     client["PC浏览器或<br/>移动播放客户端"]
 
     push -- "Rtmp" --> server
-    server -- "Http-Flv" --> client
+    server -- "Http-Flv（仍是TCP，1-3s）" --> client
 
     style push fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     style server fill:#fef3c7,stroke:#d97706,color:#78350f
     style client fill:#dcfce7,stroke:#16a34a,color:#14532d
 ```
 
-图2
+图 2：现有技术二，Http-Flv 分发
 
-如图2，相对于方法一，方法二有如下优点：
+问题归结为两点：**TCP 的重传与队头阻塞决定了延迟下界；客户端缓存决定了保密性上限**。WebRTC 基于 UDP，面向无连接，天然规避 TCP 拥塞控制的开销，且为浏览器原生设计——免插件、免安装、不在播放端落盘。这正是本方案选择的突破口。
 
-1. 基于HTTP/80传输，有效避免方案一Rtmp码流可能会被防火墙拦截的问题；
-2. 避免Rtmp码流需要客户端才能播放的问题；
-3. 实时性和直接播放Rtmp码流相当，相比于方案一播放HLS码流，播放Http-flv码流，延迟有较大的降低。
+## 2 方案设计与落地实现的对应关系
 
-#### 1.3.2 现有技术二的缺点
-
-1. 与HLS类似，由于传输特性，该方案会在本地客户端缓存流媒体资源，在保密性方面不够好；
-2. 尽管方案二将Rtmp码流封装成Http-Flv，但是与播放客户端之间本质上还是传输TCP流，由于TCP协议特性限制，延迟仍然较大（1-3秒）。
-
-## 2 本发明技术方案的详细阐述（发明内容）
-
-### 2.1 本发明所要解决的技术问题（发明目的）
-
-本发明寻求在Nginx-rtmp模块的基础上，实现一种低延迟且保密性较好的直播方案，以解决方案一和方案二的如下问题：
-
-1. 基于TCP传输码流导致播放延迟较大；
-2. 由于需要缓存流媒体资源在本地客户端，导致保密性不够好；
-3. 需要安装第三方客户端才能播放码流。
-
-由于WebRtc协议基于是UDP/IP协议传输的，相对于基于TCP的Rtmp推拉流方式，支持UDP的WebRtc方式延时低，延迟可控制在0.5秒内；由于WebRtc本身就是为浏览器设计的，无需安装客户端，且无需在播放端缓存资源，可以解决保密问题。
-
-因而，本专利将基于Nginx-rtmp模块和WebRtc协议设计直播方案，如图3所示：
+交底书给出的目标架构只有一句话：推流端照旧走 RTMP，播放端换成 WebRTC。
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -141,27 +63,32 @@ flowchart LR
     client["PC浏览器或<br/>移动播放客户端"]
 
     push -- "Rtmp" --> server
-    server -- "RTC" --> client
+    server -- "RTC（UDP，<0.5s）" --> client
 
     style push fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     style server fill:#fce7f3,stroke:#db2777,color:#831843
     style client fill:#dcfce7,stroke:#16a34a,color:#14532d
 ```
 
-图3
+图 3：方案总体架构
 
-### 2.2 本发明提供的完整技术方案（发明方案）
+对照本仓库的实际实现（`docs/架构设计.md`），方案中的抽象模块 `Nginx-WebRtc-module` 落地为挂在 OpenResty 1.31.1.1 上的一组模块，概念一一对应：
 
-基于Nginx-rtmp-module实现WebRtc直播，关键部分主要是如下几点：
+| 方案角色 | 落地实现 | 职责 |
+| --- | --- | --- |
+| HTTP 服务接口 | `ngx_rtc_http_module` | `/rtc/v1/play/` 信令，offer/answer 收发 |
+| UDP 服务 | `ngx_rtc_stream_module` | UDP :8000 上 STUN/DTLS/SRTP 媒体收发 |
+| 转发 RTC 处理模块 | `ngx_rtmp_rtc_bridge_module` | RTMP 类型模块，经 events 钩子订阅 RTMP 音视频消息 |
+| RTC 协议处理 | 纯 C 核心 `rtp/sdp/stun/dtls/srtp/audio` | 无 nginx 依赖，可 host 单测 |
+| 转码/封装 | AAC→Opus（FFmpeg+libopus）、NALU→RTP（RFC 6184） | 对应方案设计中的封装要求 |
 
-1. 管理HTTP请求生成的WebRtc链路，需要设计HTTP服务接口；
-2. 设计RTC服务并与原Nginx-rtmp模块关联；
-3. 转换接收到的Rtmp码流数据为RTC格式；
-4. 将音视频数据分别发送给播放客户端。
+一个值得注意的落地约束：桥接模块通过 `postconfiguration` 把处理器注册进 `cmcf->events[]`，**不改动 nginx-http-flv-module 一行源码**，HTTP-FLV 分发与 WebRTC 分发并行存在、互为兜底。
 
-#### 2.2.1 整体业务流程调整
+## 3 RTC 服务如何嵌进 nginx
 
-原Nginx-rtmp模块工作大致流程图如下：
+### 3.1 业务流程的扩展
+
+先看原 Nginx-rtmp 模块的工作流程，启动、初始化、握手、建通道、传数据、断开，六步线性：
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -191,18 +118,9 @@ flowchart TB
     style n6 fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
 ```
 
-图4
+图 4：原有 Nginx-rtmp 流程
 
-图4解释如下：
-
-1. Nginx启动时完成一些配置并加载第三方模块，包括Nginx-rtmp模块；
-2. Nginx-Rtmp模块初始化，读取配置文件；
-3. 与推流客户端建立Rtmp连接，保存链路信息；需要说明的是，Rtmp播放客户端连接流程与推流客户端建立连接过程类似；
-4. 建立发送码流数据通道，服务器和播放客户端间只建立一个网络链路，且该链路多个推流端复用；
-5. 传输媒体数据；该过程接受命令消息，处理音视频头部信息；最后广播音视频码流数据到所有订阅者（Rtmp播放客户端）；
-6. 当推送客户端关闭推送时，整个推送流程结束。
-
-基于Nginx-rtmp原有方案上扩展的流程如图5：
+方案的扩展在四个位置插入 RTC 环节：rtmp 初始化后并行做 RTC 服务初始化（a）；播放端经 HTTP 建立 WebRTC 连接（b）；传输媒体数据时把 RTMP 码流转发给 RTC 处理模块（c），做 RTP 封装（d）后推送给所有订阅者（e）。下图按实际实现校正——RTC 服务初始化与推流主流程并无先后耦合（交底书原图把它画成流入 rtmp 握手），播放端建链也是与推流解耦的独立路径，其结果是 session 注册为该流的订阅者，在推送环节（e）与主流程汇合：
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -210,40 +128,37 @@ flowchart TB
     pusher["推流客户端"]
     rtcplayer["rtc播放客户端"]
 
-    subgraph main["Nginx-rtmp 主流程"]
-        direction TB
-        n1["(1) nginx初始化"]
-        n2["(2) nginx-rtmp模块初始化<br/>读取配置文件"]
-        n3["(3) 握手建立rtmp连接"]
-        n4["(4) 初始化网络连接<br/>创建码流传输通道"]
-        n6["(6) 传输媒体数据"]
-        n7["(7) 断开推流"]
-        n1 --> n2 --> n3 --> n4 --> n6 --> n7
-    end
+    n1["(1) nginx初始化"]
+    n2["(2) nginx-rtmp模块初始化<br/>读取配置文件"]
+    a["a. RTC服务初始化<br/>注册HTTP/UDP服务"]
+    n3["(3) 握手建立rtmp连接"]
+    n4["(4) 初始化网络连接<br/>创建码流传输通道"]
+    n6["(6) 传输媒体数据"]
+    n7["(7) 断开推流"]
 
-    subgraph rtc["RTC 扩展流程"]
-        direction TB
-        a["a. RTC服务初始化<br/>加载配置文件"]
-        b["b. 建立播放<br/>webrtc网络连接"]
-        c["c. 转发rtmp数据<br/>至rtc处理模块"]
-        d["d. 音视频rtp数据封装"]
-        e["e. 将rtp数据推送至<br/>所有rtc订阅者"]
-        c --> d --> e
-    end
+    b["b. 建立播放<br/>webrtc网络连接"]
+    c["c. 转发rtmp数据<br/>至rtc处理模块"]
+    d["d. 音视频rtp数据封装"]
+    e["e. 将rtp数据推送至<br/>所有rtc订阅者"]
 
+    n1 --> n2 --> n3 --> n4 --> n6 --> n7
+    n2 --> a
     pusher -- "推流" --> n3
     pusher -- "断开推流" --> n7
-    n2 --> a
-    a --> n3
-    rtcplayer --> b
-    b --> n4
-    n6 --> c
-    e --> rtcplayer
+    rtcplayer -- "HTTP信令" --> b
+    a -.提供信令/媒体服务.-> b
+    n6 --> c --> d --> e
+    b -- "session注册为订阅者" --> e
+    e -- "SRTP/UDP" --> rtcplayer
 
     style pusher fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     style rtcplayer fill:#dcfce7,stroke:#16a34a,color:#14532d
-    style main fill:none,stroke:#d97706,stroke-width:2px
-    style rtc fill:none,stroke:#7c3aed,stroke-width:2px
+    style n1 fill:#f3f4f6,stroke:#6b7280,color:#1f2937
+    style n2 fill:#fef3c7,stroke:#d97706,color:#78350f
+    style n3 fill:#fef3c7,stroke:#d97706,color:#78350f
+    style n4 fill:#fef3c7,stroke:#d97706,color:#78350f
+    style n6 fill:#fef3c7,stroke:#d97706,color:#78350f
+    style n7 fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
     style a fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
     style b fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
     style c fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
@@ -251,75 +166,52 @@ flowchart TB
     style e fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
 ```
 
-图5
+图 5：扩展后的 RTC 工作流程（紫色为新增环节）
 
-解释如下：
+落地实现与图 5 的对应：a 对应 stream/http/bridge 三个模块的 nginx 标准初始化钩子；b 对应 `/rtc/v1/play/` 信令；c/d/e 对应桥接模块订阅 `NGX_RTMP_MSG_VIDEO / NGX_RTMP_MSG_AUDIO` 事件后进入纯 C 核心的 RTP 封装与逐订阅者 SRTP 加密广播。
 
-1. 在（2）Nginx-rtmp初始化完成后，紧接着做RTC服务模块初始化，加载配置文件；
-2. 创建HTTP服务接口，接受播放客户端请求，建立播放webrtc网络连接；
-3. 在（6）传输Rtmp音视频数据时，转发rtmp数据至rtc处理模块；
-4. 对音视频数据分别做封装，如音频AAC转Opus，封装视频码流为Rtp格式；
-5. 将RTP数据推送至所有RTP播放器。
+### 3.2 配置项与加载顺序
 
-#### 2.2.2 与RTC播放客户端建立连接设计
-
-```mermaid
-%%{init: {"theme": "base", "sequence": {"actorBkg": "#e0e7ff", "actorBorder": "#4338ca", "noteBkgColor": "#fef9c3", "noteBorderColor": "#ca8a04"}, "themeVariables": {"fontSize": "15px"}}}%%
-sequenceDiagram
-    autonumber
-    participant C as RTC播放客户端
-    participant H as http接口
-    participant U as udp服务
-
-    Note over H,U: RTC服务
-    C->>H: 发送http play请求
-    C->>H: 创建offer sdp并发送offer sdp
-    H->>H: 解析offer sdp
-    H->>U: 创建RtcSession
-    U->>U: 设置remote sdp、local sdp<br/>初始化session
-    U->>H: 返回local sdp
-    H->>C: 以服务端的local sdp返回answer sdp
-    C->>U: 解析sdp，ice连接检查，<br/>发起stun binding请求
-    U->>U: 进入udp业务处理模块，<br/>处理STUN消息
-    C->>U: 发起dtls握手
-    U->>C: 完成握手，客户端等待<br/>udp服务推送音视频码流
-```
-
-图6
-
-如图6，整个连接过程简单描述为：
-
-1. 播放客户端通过 HTTP 发送连接请求，携带播放URL和offer SDP；RTC服务收到播放的接入请求后，记录offer SDP和URL，返回answer sdp；
-2. 播放端解析sdp，ice连接检查，发起stun binding请求，UDP业务收到STUN请求后，处理STUN消息，返回成功；
-3. 播放端发送DTLS握手，握手成功后整个码流传输链路完成；
-4. RTC服务将播放端连接session加入到RTC订阅者列表。
-
-#### 2.2.3 RTC服务设计
-
-RTC服务设计主要提供HTTP接口和UDP服务，并将这两个模块注册原Nginx-rtmp模块。具体如下：
-
-**1、添加RTC服务配置项**
-
-基于Nginx系统添加RTC服务的主要配置项如下：
+交底书最初设想的 RTC 配置项（`stun_timeout`、`bframe`、`aac`）只是概念占位。落地后按 nginx 的模块体系重新分配到了 rtmp / http / stream 三个上下文，真实指令如下：
 
 ```nginx
+# RTMP 侧（bridge 模块，nginx-http-flv-module 的 rtmp 上下文）
+rtmp {
+    rtc_audio_bitrate 64000;       # AAC→Opus 目标码率
+    rtc_rtcp_sr_interval 2000ms;   # RTCP SR 发送周期
+    server {
+        listen 1935;
+        application live { live on; gop_cache on; }
+    }
+}
+
+# HTTP 信令侧（ngx_rtc_http_module）
+http {
+    server {
+        listen 18082;
+        location /rtc/v1/play/ {
+            access_by_lua_file conf/auth.lua;  # stream key 校验 + 限流
+            rtc_candidate_ip   172.16.48.122;  # answer 下发的 candidate
+            rtc_candidate_port 8000;
+            rtc_play;
+        }
+    }
+}
+
+# UDP 媒体侧（ngx_rtc_stream_module）
 stream {
     server {
-        listen 8000 udp;
-        stun_timeout 1s;
-        bframe true;
-        aac true;
+        listen 8000 udp reuseport;
+        rtc;                       # 交给 stream 模块处理
+        rtc_handshake_timeout 10s; # 握手中 session 空闲回收阈值
+        rtc_ready_timeout     30s; # 就绪 session 空闲回收阈值
     }
 }
 ```
 
-- listen：侦听的RTC端口，注意是UDP协议。
-- 根据需要配置如下项：
-  - stun_timeout：会话超时时间，单位秒
-  - bframe：是否保留B帧，Rtmp流中一般会有B帧，而RTC没有，默认丢弃B帧。
-  - aac：如何处理AAC音频包，默认转码成Opus，可以选择丢弃（无声音）。
+对应关系：交底书的 `stun_timeout` 拆成了 `rtc_handshake_timeout`/`rtc_ready_timeout` 两级超时；`bframe` 没有做成开关，实现里对 B 帧是**无条件丢弃**（`ngx_rtc_h264_is_b_frame`，因为 WebRTC 低延迟播放不支持 B 帧）；`aac` 同理固定转 Opus，只保留 `rtc_audio_bitrate` 一个可调参数。
 
-整个系统配置加载顺序如图7：
+配置加载遵循 nginx 模块体系的固有顺序——先系统级、再已加载模块、最后新模块，RTC 服务配置自然排在 nginx-rtmp 之后：
 
 ```mermaid
 %%{init: {"theme": "base", "flowchart": {"curve": "linear"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -331,25 +223,49 @@ flowchart LR
     style s3 fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
 ```
 
-图7
+图 6：系统配置加载顺序（交底书原图 7）
 
-**2、创建HTTP播放接口并注册进Nginx系统**
+HTTP 播放接口按 nginx 自定义模块规范创建 `ngx_command_t`、`ngx_http_module_t`、`ngx_module_t` 注册进 http 体系；UDP 服务同理走 stream 体系。需要澄清一点：交底书写的是"连接完成后为每个播放器建立播放协程与数据缓存队列，从队列读取数据发出"，落地时**没有引入协程和自建线程/队列**——媒体热路径全部跑在 nginx 单事件循环内，桥接（生产者）与 stream（消费者）同处一个地址空间，每个 session 挂 source 的订阅者队列上，RTP 到达时直接遍历订阅者逐个 SRTP 加密发送，回收交给 `ngx_event_timer` 周期 reap。这也符合方案"在 nginx 框架内完成转换、不引入独立 RTC 服务"的定位。
 
-按照Nginx规范创建HTTP业务处理模块，同时创建ngx_command_t、ngx_http_module_t和ngx_module_t对象，按照Nginx自定义配置（config）规范，将HTTP服务接口注册进Nginx系统；
+## 4 建链与桥接
 
-**3、创建UDP服务并注册进Nginx系统**
+### 4.1 与播放客户端建链
 
-1. WebRtc中音视频数据是通过UDP传输，所以须创建一个UDP服务进行发送音视频码流；该UDP提供如下功能：
-   - RTC服务监听端口，等待播放客户端连接；
-   - 在与播放器完成连接后，为每个播放器创建播放协程和数据缓存队列，协程中启动一个while循环，从队列中读取封装好的音视频数据，发送给所有的播放器。
-2. 封装RTP数据。需要封装来自Nginx-rtmp模块的音频和视频码流数据，具体：
-   - 音频数据：按照标准规范，将AAC音频转码成符合RTC的OPUS格式；注意，如果配置文件选择丢弃音频，则无需转换；
-   - 视频数据：按照标准规范，将NALU数据打包成RTP或FUA包；注意，如果配置文件中设置跳过B帧的话，需将B帧剔除。
-3. 注册进Nginx。基于Nginx规范创建UDP业务处理模块，同时创建ngx_command_t、ngx_stream_module_t和ngx_module_t对象，按照Nginx自定义配置（config）规范，并将RTC服务模块注册进Nginx系统。
+一次 WebRTC 播放要跨三个协议面：HTTP 信令交换 SDP、STUN 做 ICE 连通性检查、DTLS 建安全通道，最后才是 SRTP 媒体。落地后的实际建链时序如下（交底书原图 6 把创建 session、生成 local SDP 画在 udp 服务侧，实测中这些全部收敛到 HTTP 信令模块一次完成，udp 侧只负责按 ICE ufrag 匹配 session）：
 
-**4、RTC服务关联Nginx-rtmp模块**
+```mermaid
+%%{init: {"theme": "base", "sequence": {"actorBkg": "#e0e7ff", "actorBorder": "#4338ca", "noteBkgColor": "#fef9c3", "noteBorderColor": "#ca8a04"}, "themeVariables": {"fontSize": "15px"}}}%%
+sequenceDiagram
+    autonumber
+    participant C as RTC播放客户端
+    participant H as http接口<br/>(ngx_rtc_http_module)
+    participant U as udp服务<br/>(ngx_rtc_stream_module)
 
-创建Rtmp转RTC桥接模块，该模块主要作用是：在Nginx-rtmp模块传输音视频码流时，转发Rtmp这些码流数据到RTC服务模块；
+    Note over H,U: RTC服务
+    C->>H: POST /rtc/v1/play/（JSON: sdp + streamurl + key）
+    H->>H: Lua鉴权（stream key校验 + 限流）
+    H->>H: 解析offer sdp，创建session<br/>（进程堆分配，跨request存活）
+    H->>H: 分配SSRC/PT，生成answer sdp<br/>（含candidate + DTLS指纹）
+    H->>C: 返回answer sdp（code:0）
+    C->>U: ice连接检查，发起stun binding请求
+    U->>U: 按ICE ufrag匹配session，<br/>返回BindingResponse
+    C->>U: 发起dtls握手
+    U->>U: 握手完成，导出SRTP密钥，<br/>session订阅到source
+    U-->>C: 链路就绪，UDP持续推送音视频码流（SRTP）
+```
+
+图 7：与 RTC 播放客户端建立连接（按实际实现校正）
+
+要点：
+
+1. 播放客户端一次 POST 同时携带播放 URL 和 offer SDP（信令契约兼容 SRS `/rtc/v1/play/` JSON 格式，offer 与 play 请求合并），RTC 服务校验 key 后返回 answer SDP；
+2. session 由信令侧创建并从进程堆分配——它的生命周期跨越 HTTP 请求（返回 answer 后还要在 UDP 侧完成 DTLS/SRTP），不能用 request pool；
+3. 播放端解析 answer 发起 STUN binding，udp 服务按 ICE ufrag 匹配到 session 返回成功——匹配键是 answer 下发的 ufrag，所以 answer 必须携带 media 级 `a=candidate`，否则播放器（实测 werift）根本不会发起 STUN，表现为信令成功但零媒体；
+4. DTLS 握手完成后导出 SRTP 密钥，session 订阅到对应 source，进入订阅者列表，由 udp 服务推送加密后的音视频码流。
+
+### 4.2 RTMP→RTC 桥接
+
+方案的关键洞察是：**不改 nginx-rtmp 的分发主干，只在推送码流前插一个旁路**。
 
 ```mermaid
 %%{init: {"theme": "base", "sequence": {"actorBkg": "#fef3c7", "actorBorder": "#d97706"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -362,25 +278,36 @@ sequenceDiagram
     P->>R: 发送推流请求
     R->>B: 使用RTMP推流信息初始化桥接对象
     P->>R: 推送音视频码流
-    R->>B: 转发音视频码流至RTC服务
+    R->>B: 转发音视频码流
     B-->>R: 转发拷贝完成
     R->>R: 将数据发送给Rtmp播放器
+    B->>B: 封装RTP并经UDP推送至<br/>所有RTC订阅者
 ```
 
-图8
+图 8：Rtmp 转 RTC 桥接模块
 
-具体如图8，桥接模块需要：
+桥接模块做两件事：推流连接建立后用推流信息初始化桥接对象；在原发送逻辑把码流给 RTMP 播放器之前，先拷一份给 RTC 服务处理。封装细节：音频按标准转成 Opus，视频将 NALU 打包成 RTP single/STAP-A/FU-A 包，B 帧在封装前剔除。
 
-1. 在推流客户端与原Nginx-rtmp服务建立后，使用Rtmp推流信息初始化桥接对象；
-2. 修改Nginx-rtmp原发送音视频码流逻辑，在推流给Rtmp播放器之前，先将Rtmp码流数据发送给RTC服务模块处理。
+落地实现中，这一步对应 `ngx_rtmp_rtc_bridge_module`（`NGX_RTMP_MODULE` 类型）：它在 `postconfiguration` 阶段把视频/音频处理器注册进 `cmcf->events[]` 的 `NGX_RTMP_MSG_VIDEO / NGX_RTMP_MSG_AUDIO` 事件数组，只在 `publishing` 会话上激活，不改动 nginx-http-flv-module 源码。产出的明文 RTP 以 source 级共享（一份缓存、N 个订阅者），每个 session 加密前拷贝到自身缓冲并重写本 session 协商的 payload type——SRTP 密文逐 session 不同（DTLS 导出密钥独立），这是协议决定的拷贝下界。
 
-## 3 本发明的技术关键点和欲保护点是什么
+## 5 实测效果与实现要点
 
-本专利基于Nginx-rtmp系统设计基于WebRtc协议的直播方案，解决因Rtmp底层TCP协议限制导致延迟较高的问题；使用普通浏览器即可实现播放，兼容移动端；且不会缓存流媒体资源，保密性较好。
+端到端实测（单 worker MVP，局域网口径）：
 
-具体：
+| 指标 | 结果 |
+| --- | --- |
+| 首包延迟 | 约 560 ms（对比 RTMP/Http-Flv 1~3 s、HLS 10 s+） |
+| 视频链路 | H264 → RTP 761 包 / 362 KB，含 B 帧过滤与 FU-A 分片 |
+| 音频链路 | AAC → Opus 389 包 / 67 KB |
+| 信令鉴权 | 正确 stream key 返回 `code=0`，RTMP/HTTP-FLV/WebRTC 三路同源鉴权 |
+| 兜底能力 | HTTP-FLV 分发保留，与 WebRTC 并行 |
 
-1. 设计与RTC客户端建立连接并推送码流机制；
-2. 设计RTC服务模块，提供HTTP接口和UDP服务；
-3. 基于Nginx系统，设计加载RTC服务配置项和RTC初始化逻辑；
-4. 基于Nginx-Rtmp模块框架，设计Rtmp码流转给RTC服务的方案。
+从方案设计到可运行的代码，骨架（图 5/7/8）与设计一致，真正花时间的是几处协议细节，分享三个最容易踩的：
+
+1. **session 不能用 request pool 分配**。session 生命周期跨越 HTTP 请求——返回 answer 之后还要在 UDP 侧完成 DTLS/SRTP。用 `r->pool` 会在响应返回后内存失效，后续 STUN 匹配读到垃圾。正确做法是 `ngx_alloc` 从进程堆分配，配合空闲 reap 定时器回收。
+2. **DTLS server 要显式 `SSL_set_accept_state`**。OpenSSL 不会因为用了 `DTLS_server_method()` 就自动进入 accept 状态，漏掉这一步报 `ssl_read_internal:uninitialized`，握手无感知失败。
+3. **STUN username 的顺序不一定是 RFC 里那个**。UDP 侧要靠 ICE ufrag 从 username 里匹配 session，标准写法是 `client_ufrag:server_ufrag`，但实测 werift 发出来的是 `server_ufrag:client_ufrag`——前半是服务端 ufrag。取错一半，STUN 永远匹配不到 session，媒体零包且没有任何报错。
+
+其余约束（GOP 环形缓存、RTCP 反馈、跨 worker 演进等）见 `docs/架构设计.md` 与 `docs/详细设计.md`。
+
+方案的四个核心技术点，在落地中全部得到验证：与 RTC 客户端建链并推送码流的机制（图 7）、HTTP 接口 + UDP 服务的 RTC 服务模块（图 5 的 a/b）、nginx 体系内的 RTC 配置加载与初始化（图 6）、以及不改动原模块的 RTMP 码流转 RTC 桥接方案（图 8）。
