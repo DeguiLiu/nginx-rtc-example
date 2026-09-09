@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# build-win64-msys2.sh - build the Windows nginx.exe live service inside MSYS2.
+#
+# Run this INSIDE an MSYS2 MINGW64 shell on Windows, never on Linux. It follows
+# OpenResty's upstream util/build-win32.sh flow (native mingw64 gcc, no
+# --crossbuild hack) and injects this repo's two addon modules:
+#
+#   nginx-rtc-module        RTMP/WHIP -> WebRTC (SRTP over UDP)
+#   nginx-http-flv-module   RTMP core the bridge links against
+#
+# Third-party media libs (FFmpeg/opus/libsrtp) come from MSYS2 pacman packages
+# and are exposed to the addon as NGX_RTC_THIRD=/mingw64. OpenSSL/PCRE2/zlib
+# are built from source by OpenResty, exactly like the upstream Windows build.
+#
+# Usage (inside MINGW64):
+#   ./scripts/build-win64-msys2.sh
+#
+# Optional overrides:
+#   JOBS=8                 parallel make jobs (default: NUMBER_OF_PROCESSORS)
+#   NGX_RTC_MODULE_SRC=... local module checkout override
+set -euo pipefail
+
+if [ "${MSYSTEM:-}" != "MINGW64" ]; then
+    echo "error: run this inside the MSYS2 MINGW64 shell (MSYSTEM=$MSYSTEM)" >&2
+    exit 1
+fi
+
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="$BASE/build-win64"
+SRC="$BUILD/src"
+OUT="$BUILD/openresty-win64"
+JOBS=${JOBS:-"${NUMBER_OF_PROCESSORS:-8}"}
+
+ORX_VER=1.31.1.1
+ORX="openresty-$ORX_VER"
+PCRE=pcre2-10.47
+ZLIB=zlib-1.3.2
+OPENSSL=openssl-3.5.6
+MOD_VER=v0.3.0
+HFLV_VER=v1.2.14
+
+mkdir -p "$SRC"
+
+echo "== [1/6] install mingw64 toolchain + rtc third-party libs =="
+pacman -S --needed --noconfirm \
+    mingw-w64-x86_64-toolchain \
+    base-devel \
+    perl \
+    mingw-w64-x86_64-ffmpeg \
+    mingw-w64-x86_64-opus \
+    mingw-w64-x86_64-libsrtp \
+    wget git unzip tar
+
+echo "== [2/6] download OpenResty + static dep sources =="
+cd "$SRC"
+[ -s "$ORX.tar.gz" ] || wget -O "$ORX.tar.gz" \
+    "https://openresty.org/download/$ORX.tar.gz"
+[ -s "$OPENSSL.tar.gz" ] || wget -O "$OPENSSL.tar.gz" \
+    "https://github.com/openssl/openssl/releases/download/$OPENSSL/$OPENSSL.tar.gz"
+[ -s "$ZLIB.tar.gz" ] || wget -O "$ZLIB.tar.gz" \
+    "https://zlib.net/$ZLIB.tar.gz"
+[ -s "$PCRE.tar.gz" ] || wget -O "$PCRE.tar.gz" \
+    "https://github.com/PCRE2Project/pcre2/releases/download/$PCRE/$PCRE.tar.gz"
+
+[ -d "$ORX" ] || tar -xzf "$ORX.tar.gz"
+
+echo "== [3/6] clone the two addon modules =="
+if [ -n "${NGX_RTC_MODULE_SRC:-}" ]; then
+    MOD="$NGX_RTC_MODULE_SRC"
+    echo "  nginx-rtc-module: local override $MOD"
+else
+    MOD="$SRC/nginx-rtc-module"
+    [ -d "$MOD/.git" ] || git clone -q --depth 1 --branch "$MOD_VER" \
+        https://github.com/DeguiLiu/nginx-rtc-module "$MOD"
+fi
+HFLV="$SRC/nginx-http-flv-module"
+[ -d "$HFLV/.git" ] || git clone -q --depth 1 --branch "$HFLV_VER" \
+    https://github.com/winshining/nginx-http-flv-module "$HFLV"
+
+echo "== [4/6] patch http-flv int8_t guard for MinGW =="
+sed -i 's/#if (NGX_WIN32)/#if (NGX_WIN32 \&\& defined(_MSC_VER))/' \
+    "$HFLV/ngx_rtmp.h"
+
+echo "== [5/6] extract static deps + configure =="
+cd "$SRC/$ORX"
+rm -rf objs
+mkdir -p objs/lib
+cd objs/lib
+tar -xf "../../../$OPENSSL.tar.gz"
+tar -xf "../../../$ZLIB.tar.gz"
+tar -xf "../../../$PCRE.tar.gz"
+cd "$SRC/$ORX"
+
+(cd "objs/lib/$OPENSSL" \
+    && patch -p1 < "../../../patches/openssl-3.5.5-sess_set_get_cb_yield.patch")
+
+NGX_RTC_THIRD=/mingw64 ./configure \
+    --with-cc=gcc \
+    --prefix="$OUT" \
+    --with-cc-opt='-DFD_SETSIZE=1024' \
+    --sbin-path=nginx.exe \
+    --with-pcre-jit \
+    --without-http_rds_json_module \
+    --without-http_rds_csv_module \
+    --without-lua_rds_parser \
+    --with-ipv6 \
+    --with-stream \
+    --with-stream_ssl_module \
+    --with-stream_ssl_preread_module \
+    --with-http_v2_module \
+    --without-mail_pop3_module \
+    --without-mail_imap_module \
+    --without-mail_smtp_module \
+    --with-http_stub_status_module \
+    --with-http_realip_module \
+    --with-http_addition_module \
+    --with-http_auth_request_module \
+    --with-http_secure_link_module \
+    --with-http_random_index_module \
+    --with-http_gzip_static_module \
+    --with-http_sub_module \
+    --with-http_dav_module \
+    --with-http_flv_module \
+    --with-http_mp4_module \
+    --with-http_gunzip_module \
+    --with-select_module \
+    --with-luajit-xcflags="-DLUAJIT_NUMMODE=2 -DLUAJIT_ENABLE_LUA52COMPAT" \
+    --with-pcre="objs/lib/$PCRE" \
+    --with-zlib="objs/lib/$ZLIB" \
+    --with-openssl="objs/lib/$OPENSSL" \
+    --add-module="$MOD" \
+    --add-module="$HFLV" \
+    -j"$JOBS"
+
+echo "== [6/6] make && make install =="
+make -j"$JOBS"
+make install
+
+echo "== stage runtime DLLs (FFmpeg/opus/libsrtp/pthread) =="
+# nginx.exe links OpenSSL statically (built from source), but the pacman media
+# libs are DLL import libs, so collect their transitive runtime DLLs from
+# /mingw64/bin. Windows system DLLs are absent there and are skipped naturally.
+collect_dlls() {
+    local exe="$1"
+    objdump -p "$exe" 2>/dev/null \
+        | sed -n 's/.*DLL Name: \(.*\)/\1/p' \
+        | while read -r dll; do
+            local src="/mingw64/bin/$dll"
+            if [ -f "$src" ] && [ ! -f "$OUT/$dll" ]; then
+                cp "$src" "$OUT/"
+                collect_dlls "$src"
+            fi
+        done
+}
+collect_dlls "$OUT/nginx.exe"
+
+echo ""
+echo "[done] nginx.exe installed under:"
+echo "  $OUT"
+echo ""
+echo "next: copy this repo's deploy/nginx/{conf,html} over $OUT, then run:"
+echo "  cd $OUT && ./nginx.exe -p ."
