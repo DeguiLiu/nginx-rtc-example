@@ -36,7 +36,10 @@ ORX="openresty-$ORX_VER"
 PCRE=pcre2-10.47
 ZLIB=zlib-1.3.2
 OPENSSL=openssl-3.5.6
-MOD_VER=v0.3.0
+# The win32-compat branch carries the MinGW .dll.a / winpthread config fix; the
+# released v0.3.0 tag predates it. Override with NGX_RTC_MODULE_SRC for a local
+# checkout while iterating.
+MOD_VER=win32-compat
 HFLV_VER=v1.2.14
 
 mkdir -p "$SRC"
