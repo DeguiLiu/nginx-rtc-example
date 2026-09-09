@@ -1,116 +1,110 @@
-# nginx-rtc-example — 自研 nginx-rtc-module 的部署示例(RTMP/WHIP → WebRTC 低延迟直播)
+# nginx-rtc-example
 
-自研 C 模块跑在 OpenResty/nginx 上，把 RTMP 或 WHIP 推流转成
-RTP/SRTP，通过 UDP 直出给浏览器 WebRTC 播放；同源同时支持 HTTP-FLV / HLS / DASH 多协议输出，
-并把每条推流录制为 FLV 落盘。WebRTC 失败或超时会自动降级到 HTTP-FLV 播放器。
-架构一句话：`ffmpeg/WHIP 推流 → nginx(RTMP/HTTP) → 自研模块(bridge→媒体环/shm→SRTP/UDP) → 浏览器 WebRTC`。
+Example deploy of [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module), an in-nginx C module for RTMP/WHIP → WebRTC low-latency live streaming.
 
-> **代码导航**：自研 C 源码在独立**公开仓 [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)**
-> (MIT, 当前钉 tag v0.2.0)；本仓只保留组装件：deploy 配置/Lua、播放页、client、构建运维脚本与文档。
-> 详细设计见 `docs/`(架构、多 worker shm 设计、关键概念、评估报告等)。
+[中文文档](README.zh.md)
 
-## 目录
+The module runs inside OpenResty/nginx. RTMP or WHIP pushes come in, the module turns them into RTP/SRTP and sends them over UDP straight to browser WebRTC players. The same origin also serves HTTP-FLV, HLS, and DASH, and records every stream to FLV on disk. If WebRTC fails or stalls, the player falls back to HTTP-FLV.
+
+Pipeline:
 
 ```
-vendor/                 依赖说明(不内嵌任何源码; 唯一内嵌三方运行时资产见下)
+ffmpeg/WHIP → nginx (RTMP/HTTP) → module (bridge → shm media ring → SRTP/UDP) → browser WebRTC
+```
+
+## Repos
+
+The C code lives in its own public repo, [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module) (MIT). This repo keeps only the glue: deploy config + Lua, player pages, client scripts, build/ops scripts, and docs. See `docs/` for architecture, multi-worker shm design, and evaluation notes.
+
+## Layout
+
+```
+vendor/                 dependency notes (no embedded source, except one runtime asset, below)
 deploy/nginx/
-  conf/                   nginx.conf + 自研 *.lua(HMAC 鉴权/stats/flvplayer/观众计数…)
-  html/                   rtcplayer.html(WebRTC 播放页)/flv.min.js(flv.js v1.6.2 三方)/hmac-sha256.js
-client/                  Node 端播放/推流脚本(play.mjs 播放、whip_push.mjs WHIP 推流)
-scripts/                 fetch-deps.sh(拉三方) / build-deps.sh(编静态库) / build-openresty.sh(编 nginx)
-docs/                    设计、评估、实现指南等文档(含中文设计/测试/编译文档)
-run.sh                   sync / nginx / push / keep-push / stop / verify
+  conf/                 nginx.conf + *.lua (HMAC auth, stats, flvplayer, viewer count)
+  html/                 rtcplayer.html / flv.min.js (flv.js v1.6.2) / hmac-sha256.js
+client/                 play.mjs (play), whip_push.mjs (WHIP push)
+scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
+docs/                   design, evaluation, implementation guides (Chinese)
+run.sh                  sync / nginx / push / keep-push / stop / verify
 ```
 
-## 依赖与版本
+## Dependencies
 
-仓库**不内嵌任何 C 源码/二进制**(自研模块与三方依赖都不入库)。全部由 `scripts/fetch-deps.sh`
-构建时按钉死 ref 拉取到 `scripts/_cache/`(gitignored), 再经 build 脚本解包/浅克隆编译:
+Nothing is vendored: neither the module nor third-party C source. `scripts/fetch-deps.sh` pulls everything at build time into `scripts/_cache/` (gitignored) at pinned refs, and the build scripts unpack/clone and compile it.
 
-| 依赖 | 形式 | 版本/来源 |
+| Dependency | Form | Version / source |
 |---|---|---|
-| nginx-rtc-module(自研 C 模块) | build 时浅克隆钉 tag | v0.2.0 (公开 DeguiLiu/nginx-rtc-module, MIT) |
-| OpenResty | build 时拉取 | 1.31.1.1 (openresty.org 发行) |
-| nginx-http-flv-module | build 时浅克隆钉 tag | v1.2.14 (winshining/nginx-http-flv-module) |
-| Opus | build 时拉取 | 1.3.1 (xiph/opus) |
-| libsrtp | build 时拉取 | 2.3.0 (ciscosystems/libsrtp) |
-| FFmpeg 精简库 | build 时拉取 | aac 解码 + swresample + avutil (FFmpeg n6.1) |
-| libavcodec/swresample/avutil | 见上 | 同上(音频 worker 用) |
+| nginx-rtc-module | shallow clone at build time | v0.2.0 (DeguiLiu/nginx-rtc-module, MIT) |
+| OpenResty | tarball at build time | 1.31.1.1 (openresty.org) |
+| nginx-http-flv-module | shallow clone at build time | v1.2.14 (winshining/nginx-http-flv-module) |
+| Opus | tarball at build time | 1.3.1 (xiph/opus) |
+| libsrtp | shallow clone at build time | 2.3.0 (ciscosystems/libsrtp) |
+| FFmpeg (subset) | shallow clone at build time | aac decode + swresample + avutil (FFmpeg n6.1) |
 
-唯一内嵌的第三方是运行时 web 资产 `deploy/nginx/html/flv.min.js`(flv.js v1.6.2, Apache-2.0),
-播放页直接引用、保证离线完整; 来源见 `vendor/README.md`。
+The one embedded third-party asset is `deploy/nginx/html/flv.min.js` (flv.js v1.6.2, Apache-2.0), kept so the player page works offline; see `vendor/README.md`.
 
-预编译产物统一进 `build/third/{include,lib}`(与旧 `/.../third` 同构)。模块的 addon `config`
-(fetch 至 `build/src/nginx-rtc-module`)经 `NGX_RTC_THIRD` 定位——`build-openresty.sh` 已显式传入；
-本机已有预编译库时可 `export NGX_RTC_THIRD=/path/to/third` 跳过重编。
+Prebuilt libs land in `build/third/{include,lib}`. The module's addon `config` finds them via `NGX_RTC_THIRD`, which `build-openresty.sh` passes explicitly. If you already have a prebuilt tree, `export NGX_RTC_THIRD=/path/to/third` skips the rebuild.
 
-## 构建
+## Build
 
 ```bash
-# 一键入口(推荐): 串起下面三步, 等价于 fetch → build-deps → build-openresty
+# one-shot: fetch → build-deps → build-openresty
 scripts/setup.sh
 
-# 0) 模块 host 单测在模块仓做(不需要 nginx/第三方):
-#    git clone --depth 1 --branch v0.2.0 https://github.com/DeguiLiu/nginx-rtc-module
-#    make -C nginx-rtc-module/test run_tests
+# module host unit tests run in the module repo (no nginx/ffmpeg needed):
+#   git clone --depth 1 --branch v0.2.0 https://github.com/DeguiLiu/nginx-rtc-module
+#   make -C nginx-rtc-module/test test
 
-# 1) 拉取全部依赖源: 自研模块/http-flv/opus 浅克隆钉 tag, openresty/libsrtp/ffmpeg 下载
-#    (已缓存则秒过; github 被墙的主机先 export HTTPS_PROXY=http://127.0.0.1:7890)
+# fetch all dependency sources (cached runs are instant; on github-blocked
+# hosts export HTTPS_PROXY=http://127.0.0.1:7890 first)
 scripts/fetch-deps.sh
 
-# 2) 编静态库(opus/libsrtp/ffmpeg-lite) → build/third
+# build static libs (opus/libsrtp/ffmpeg) -> build/third
 scripts/build-deps.sh
 
-# 3) 装配 openresty + nginx-rtc-module + nginx-http-flv-module 编译 → 输出前缀(默认 build/nginx)
+# configure + build openresty + module + http-flv -> build/nginx
 OPENRESTY_PREFIX=$PWD/build/nginx scripts/build-openresty.sh
 ```
 
-## 运行(运维)
+## Run
 
 ```bash
-OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx     # sync deploy 配置 + 启动
-./run.sh push          # ffmpeg 推 livestream(画面左上角烧北京秒表, 便于目测延迟)
-./run.sh keep-push     # 保活版推流(ffmpeg 退出自动重启, stop 会一并停掉)
-./run.sh verify        # node client/play.mjs 冒烟播放
+OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync config + start
+./run.sh push          # ffmpeg pushes livestream (Beijing wall clock burned in for latency eyeballing)
+./run.sh keep-push     # supervised push, auto-restarts ffmpeg
+./run.sh verify        # node client/play.mjs smoke playback
 ./run.sh stop
 ```
 
-实例前缀解析：`OPENRESTY_PREFIX` env → `build/nginx`；均缺失则报错退出(提示先跑 `scripts/setup.sh`)。
-`run.sh` 的 `nginx|start` 会先 `sync`：把 `deploy/nginx/{conf,html}` 拷入前缀并生成
-`conf/nginx.rtc.conf`(候选 IP 自动探测或 `RTC_CANDIDATE_IP` 覆盖)。
+Prefix resolution: `OPENRESTY_PREFIX`, then `build/nginx`, else error. `run.sh nginx|start` syncs `deploy/nginx/{conf,html}` into the prefix and generates `conf/nginx.rtc.conf` (candidate IP auto-detected or `RTC_CANDIDATE_IP`).
 
-### 端口与入口
+### Ports
 
-| 端口/协议 | 用途 |
+| Port | Purpose |
 |---|---|
-| 18082 HTTP | `/flvplayer`(HTTP-FLV 页)、`/rtcplayer.html`(WebRTC 页)、`/rtc/v1/stats`、`/rtc/v1/flvcnt`、`/metrics` |
-| 1935 RTMP | 推流与 HTTP-FLV 源 |
-| 8000 UDP  | WebRTC SRTP/SRTCP + ICE/STUN |
+| 18082 HTTP | `/flvplayer`, `/rtcplayer.html`, `/rtc/v1/stats`, `/rtc/v1/flvcnt`, `/metrics` |
+| 1935 RTMP | push ingest + HTTP-FLV source |
+| 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
-鉴权统一 HMAC token：`t`=过期秒，`sign`=base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`))；
-默认演示 secret `demo-secret-0123456789abcdef0123456789abcdef`，每流 secret 见 `deploy/nginx/conf/stream_keys.lua`。
+Auth is an HMAC token: `t` = expiry seconds, `sign` = base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`)). Demo secret: `demo-secret-0123456789abcdef0123456789abcdef`. Per-stream secrets are in `deploy/nginx/conf/stream_keys.lua`.
 
-### 录制
+### Recording
 
-`application live` 内 `record all; record_path rec;` 把每条推流录制为 FLV，落盘到
-`<prefix>/rec/<stream>-<timestamp>.flv`（仅实际收流 worker 写，auto_push 副本跳过）。
-文件不通过 HTTP 暴露，运维直接从该目录拉取；`run.sh nginx` 会先 `mkdir -p` 该目录。
+`record all; record_path rec;` in `application live` records each publish to `<prefix>/rec/<stream>-<timestamp>.flv` (written by the worker that actually receives it; auto_push copies are skipped). Files aren't served over HTTP — pull them from disk. `run.sh nginx` creates the directory.
 
-### 播放器自动降级
+### Player fallback
 
-`rtcplayer.html` 在 WebRTC `connectionState`/`iceConnectionState` 进入 `failed`，或 10 秒内
-未收到媒体时，自动跳转到 `/flvplayer?app=&stream=&key=`（HTTP-FLV 播放器，同目标预填），
-保证弱网/连接失败时仍有可播放链路。
+`rtcplayer.html` redirects to `/flvplayer?app=&stream=&key=` (same target prefilled) when WebRTC `connectionState`/`iceConnectionState` hits `failed`, or when no media arrives within 10 s.
 
-## 测试
+## Testing
 
-- 模块 host 单测：在 [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module) 仓
-  `make -C test run_tests`(71 用例，纯 C 无 nginx 依赖)。
-- 端到端：`./run.sh verify`(werift 客户端播放冒烟)。
+- Host unit tests: in [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module), `make -C test test` (pure C, no nginx).
+- End to end: `./run.sh verify` (werift playback smoke test).
 
 ## License
 
-- 自研 C 模块：**MIT**(c) 2026 DeguiLiu, 见公开仓 [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)。
-- 本仓(部署配置/Lua/播放页/client/docs/脚本)：缺省私有，发布前补 LICENSE。
-- 编译依赖(OpenResty / nginx-http-flv-module / opus / libsrtp / FFmpeg)：构建时拉取, 各自保留上游 LICENSE。
-- 唯一内嵌第三方运行时资产：`deploy/nginx/html/flv.min.js`(flv.js v1.6.2, Apache-2.0), 来源见 `vendor/README.md`。
+- C module: MIT (c) 2026 DeguiLiu, in [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module).
+- This repo (config, Lua, pages, client, docs, scripts): private; add a LICENSE before publishing.
+- Build deps: fetched at build time, each keeps its own upstream LICENSE.
+- `deploy/nginx/html/flv.min.js`: flv.js v1.6.2, Apache-2.0; see `vendor/README.md`.
