@@ -23,7 +23,10 @@ mkdir -p "$BUILD/src"
 
 # stage a fetched git dep from cache into build/src (idempotent)
 stage_git() { # <name> <marker-file>
-    local name="$1" marker="$2" dst="$BUILD/src/$name"
+    local name marker dst
+    name="$1"
+    marker="$2"
+    dst="$BUILD/src/$name"
     if [ -f "$dst/$marker" ]; then return 0; fi
     [ -d "$CACHE/$name/.git" ] || { echo "run scripts/fetch-deps.sh first ($name)"; exit 1; }
     echo "== $name source: stage from cache =="

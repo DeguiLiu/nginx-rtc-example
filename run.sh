@@ -15,7 +15,7 @@ DEPLOY="$BASE/deploy/nginx"
 if [ -n "${OPENRESTY_PREFIX:-}" ]; then
     ORX="$OPENRESTY_PREFIX"
 elif [ -d "$BASE/build/nginx" ]; then
-    ORX="$BASE/build/nginx"
+    ORX="$BASE/build/nginx/nginx"
 else
     ORX="$BASE/../openresty-rtmp-new/nginx"
 fi

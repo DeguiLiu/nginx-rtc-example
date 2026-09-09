@@ -4,9 +4,11 @@
 > 所有 nginx 源码行号基于 `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/`，
 > 模块代码基于 `/home/dgliu/workspace/webrtc/ngx-rtc-module/`。
 >
-> **实现状态（2026-09-09）**：阶段 0 与阶段 1 已完成并落地，采用「双 registry 镜像」方案（见 0.4），
-> 与本文第 4 节原始「单一 registry + 私有扩展」方案存在偏差。阶段 2（shm 媒体环 + 跨 worker eventfd 唤醒）、
-> 阶段 3（锁粒度 / GC / 快路径）、阶段 4（跨机 relay）仍为规划，尚未实现。
+> **实现状态（2026-09-09，已修订）**：阶段 0 与阶段 1 已完成并落地，采用「双 registry 镜像」方案（见 0.4），
+> 与本文第 4 节原始「单一 registry + 私有扩展」方案存在偏差。阶段 2（shm 媒体环 + 跨 worker eventfd 唤醒）
+> **已完全实现并端到端验证**。阶段 3 **部分完成**：每 ring 独立锁（`ring->mtx`）、source 空/断连回收、
+> 环满丢帧埋点（`ring_drops`）、GOP 关键帧快照下沉 shm 已落地；每 source 锁、ring 无锁 CAS、
+> expire+LRU 强淘汰、同 worker 直发快路径仍未实现。阶段 4（跨机 relay）未开始（可选）。
 
 ## 0. 结论
 
@@ -20,16 +22,16 @@
    `ngx_rtc_source_t` / `ngx_rtc_session_t`（含全部私有状态，媒体热路径继续用它），另建 shm 骨架
    `ngx_rtc_shm_source_t` / `ngx_rtc_shm_session_t` 只存跨 worker 必需元数据，两者按 name/ufrag 关联。
    理由与取舍见 0.4。
-3. **媒体数据本体放 shm 环形队列，不逐个 session 拷贝**（阶段 2，未开始）：RTMP worker 完成一次
+3. **媒体数据本体放 shm 环形队列，不逐个 session 拷贝**（阶段 2，已完成）：RTMP worker 完成一次
    H264→RTP 封装后，把明文 RTP 包 + 目标 session 列表写入**每个目标 worker 一个 MPSC 环形队列**，
    由目标 worker 消费并做 per-session SRTP 加密发送。零拷贝到 socket 不可能——SRTP 每 session 密钥不同、
    必须就地变换，因此「每 worker 一份明文拷贝」是理论下界。
-4. **跨 worker 唤醒不能用 `ngx_notify`**（阶段 2，未开始）：`ngx_notify` 是**进程内** eventfd
+4. **跨 worker 唤醒不能用 `ngx_notify`**（阶段 2，已完成）：`ngx_notify` 是**进程内** eventfd
    （`ngx_epoll_module.c:386-430`），只能唤醒本 worker。跨 worker 唤醒用 **master 在 fork 前创建的
    per-worker eventfd 数组**（所有 worker 继承全部 fd，可互写），fd 号存入 shm；写环后写 8 字节唤醒目标 worker。
 5. **落地分 4 阶段、最小改动**：阶段 0（`rtc_zone` + slab zone 初始化）与阶段 1（元数据上 shm，信令/绑定跨
-   worker 正确）**已完成**；阶段 2（媒体环 + eventfd）、阶段 3（锁粒度/GC/快路径）、阶段 4（跨机 relay）未开始。
-   全程只改模块，不改 nginx/http-flv 源码。
+   worker 正确）**已完成**；阶段 2（媒体环 + eventfd）**已完成并验证**；阶段 3（锁粒度/GC/快路径）**部分完成**；
+   阶段 4（跨机 relay）未开始（可选）。全程只改模块，不改 nginx/http-flv 源码。
 6. **封装模板**：source/session 注册表照搬 `ngx_http_limit_req_init_zone` 三段式 zone 初始化 + 全局
    `shpool->mutex`；expire + LRU 淘汰**未在阶段 1 落地**（当前为显式 remove），属阶段 3（见 3.7）。
 
@@ -417,7 +419,7 @@ queue/sub_queue/sn/dtls_timer，作为媒体平面唯一操作对象；shm sessi
 |------|----|---------|------|
 | L0 | `shpool->mutex`（全局自旋锁，slab 自带） | 所有 shm 分配/释放、红黑树/队列头指针变更 | **阶段 1 已用** |
 | L1 | 每 source 一把 `ngx_shmtx_t` | `subscribers` 快照、seq/ts 推进、SPS/PPS 写 | 阶段 3（未开始） |
-| L2 | 每 worker ring 一把（或 CAS head） | 环队列入队/出队 | 阶段 2/3（未开始） |
+| L2 | 每 worker ring 一把 `ngx_shmtx_t`（或 CAS head） | 环队列入队/出队 | **已实现**（每 ring 独立 `ring->mtx`）；无锁 CAS 属阶段 3 未做 |
 
 **锁序铁律（防死锁）**：`pool->mutex` 只出现在 `ngx_slab_alloc/free` 内部，业务锁（source/ring）**必须
 在调用 slab 之前释放**；source 锁 → ring 锁单向，禁止反向。这与「L1 Singleton → L2 Context → L3 Device 禁反向」
@@ -609,21 +611,22 @@ uint64_t one = 1;
   （见 0.4、1.4）。媒体仍是单 worker 语义（推流与 UDP 同 worker 才通），信令→绑定→订阅的跨 worker 一致性已成立。
   验收：HTTP 与 UDP 分属不同 worker 时，STUN 能找到 session、DTLS 能完成。
 
-### 阶段 2：媒体环形队列 + 跨 worker 唤醒 —— 未开始
+### 阶段 2：媒体环形队列 + 跨 worker 唤醒 —— 已完成
 
-- 启用 `ctx->notify_fd[w]` 与 `ctx->rings[w]`（阶段 0 未落地，需在阶段 2 追加到 `ngx_rtc_shm_ctx_t`）。
-- 实现 shm `ngx_rtc_ring_t`（MPSC 锁/CAS）与消费 handler；RTMP worker 按 `owner_slot` 分组写环 + 写 eventfd；
+- 启用 `ctx->notify_fd[w]` 与 `ctx->rings[w]`（已追加到 `ngx_rtc_shm_ctx_t`）。
+- 实现 shm `ngx_rtc_shm_ring_t`（MPSC，每 ring 独立 `ring->mtx` 锁）与消费 handler；RTMP worker 按 `owner_slot`
+  分组写环 + 写 eventfd；
   UDP worker handler 读环 → 查本 worker 进程内 session → `ngx_rtc_session_send_rtp`。
-- `nginx.conf` 改 `worker_processes auto;`，UDP listen 增加 `reuseport`。
-- 验收：推流、信令、UDP 分散在不同 worker 时，浏览器可正常起播、连续播放。
+- `nginx.conf` 用 `worker_processes 2;`（未用 auto，可后续调），UDP listen 已增加 `reuseport`。
+- 验收：推流、信令、UDP 分散在不同 worker 时，浏览器可正常起播、连续播放（已端到端验证，丢包 0%、首帧约 550ms）。
 - 演进方式见 5.6（复用双 registry 分工，不推翻）。
 
-### 阶段 3：优化与收尾 —— 未开始
+### 阶段 3：优化与收尾 —— 部分完成
 
-- 每 source 锁替代全局锁保护 subscriber/计数器；ring 入队换无锁 CAS。
-- session/source 引用计数与 GC（含 3.4 的 expire+LRU 强淘汰重试）：无发布者且无订阅者超时回收；
-  断连清理 shm 骨架 + 进程内结构。
-- 同 worker 直发快路径；环满丢帧监控埋点；`sps_len==0` 新订阅者拉 GOP 缓存（可选，复用 `gop_cache`）。
+- 已完成：媒体环改用每 ring 独立 `ring->mtx`（不再抢全局 `shpool->mutex`）；source 空/断连回收
+  （`free_locked` 的 source GC + `close_requested` 踢人断流）；环满丢帧埋点（`ring_drops`）；
+  GOP 缓存升级为「关键帧 AU 快照下沉 shm」，任意 worker 订阅秒开。
+- 未完成：每 source 独立锁（L1）；ring 入队无锁 CAS（L2）；expire+LRU 强淘汰；同 worker 直发快路径。
 
 ### 阶段 4（可选，跨机）：外部 relay —— 未开始
 
