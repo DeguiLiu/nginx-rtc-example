@@ -6,10 +6,8 @@ scripts/_cache/
 *.so
 *.so.*
 
-# Test artifacts
-module/test/build/
-module/test/run_tests
-module/test/*.d
+# Node client deps (client/werift etc.)
+node_modules/
 
 # Runtime / logs / generated config
 *.log
