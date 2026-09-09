@@ -1,4 +1,4 @@
-# rtc-gateway — 自研 RTMP/WHIP → WebRTC 低延迟直播网关
+# nginx-rtc-example — 自研 nginx-rtc-module 的部署示例(RTMP/WHIP → WebRTC 低延迟直播)
 
 自研 C 模块跑在 OpenResty/nginx 上，把 RTMP 或 WHIP 推流转成
 RTP/SRTP，通过 UDP 直出给浏览器 WebRTC 播放；同源同时支持 HTTP-FLV / HLS / DASH 多协议输出。
