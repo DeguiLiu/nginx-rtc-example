@@ -5,7 +5,7 @@ RTP/SRTP，通过 UDP 直出给浏览器 WebRTC 播放；同源同时支持 HTTP
 架构一句话：`ffmpeg/WHIP 推流 → nginx(RTMP/HTTP) → 自研模块(bridge→媒体环/shm→SRTP/UDP) → 浏览器 WebRTC`。
 
 > **代码导航**：自研 C 源码在独立**公开仓 [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)**
-> (MIT, 当前钉 tag v0.1.0)；本仓只保留组装件：deploy 配置/Lua、播放页、client、构建运维脚本与文档。
+> (MIT, 当前钉 tag v0.2.0)；本仓只保留组装件：deploy 配置/Lua、播放页、client、构建运维脚本与文档。
 > 详细设计见 `docs/`(架构、多 worker shm 设计、关键概念、评估报告等)。
 
 ## 目录
@@ -28,7 +28,7 @@ run.sh                   sync / nginx / push / keep-push / stop / verify
 
 | 依赖 | 形式 | 版本/来源 |
 |---|---|---|
-| nginx-rtc-module(自研 C 模块) | build 时浅克隆钉 tag | v0.1.0 (公开 DeguiLiu/nginx-rtc-module, MIT) |
+| nginx-rtc-module(自研 C 模块) | build 时浅克隆钉 tag | v0.2.0 (公开 DeguiLiu/nginx-rtc-module, MIT) |
 | OpenResty | build 时拉取 | 1.31.1.1 (openresty.org 发行) |
 | nginx-http-flv-module | build 时浅克隆钉 tag | v1.2.14 (winshining/nginx-http-flv-module) |
 | Opus | build 时拉取 | 1.3.1 (xiph/opus) |
@@ -50,7 +50,7 @@ run.sh                   sync / nginx / push / keep-push / stop / verify
 scripts/setup.sh
 
 # 0) 模块 host 单测在模块仓做(不需要 nginx/第三方):
-#    git clone --depth 1 --branch v0.1.0 https://github.com/DeguiLiu/nginx-rtc-module
+#    git clone --depth 1 --branch v0.2.0 https://github.com/DeguiLiu/nginx-rtc-module
 #    make -C nginx-rtc-module/test run_tests
 
 # 1) 拉取全部依赖源: 自研模块/http-flv/opus 浅克隆钉 tag, openresty/libsrtp/ffmpeg 下载

@@ -7,7 +7,7 @@
 
 | 依赖 | 用途 | 钉住 ref | 来源 |
 |---|---|---|---|
-| nginx-rtc-module(自研) | RTC 核心 + 4 个注册模块, 随 nginx 同编 | tag v0.1.0 | DeguiLiu/nginx-rtc-module(MIT, 公开) |
+| nginx-rtc-module(自研) | RTC 核心 + 4 个注册模块, 随 nginx 同编 | tag v0.2.0 | DeguiLiu/nginx-rtc-module(MIT, 公开) |
 | OpenResty | 宿主 nginx | 1.31.1.1 | openresty.org |
 | nginx-http-flv-module | HTTP-FLV / RTMP 引擎, 与其 RTMP 核心同编 | tag v1.2.14 | winshining/nginx-http-flv-module |
 | Opus | libopus.a(Opus 编码) | v1.3.1 | xiph/opus |
