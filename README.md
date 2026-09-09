@@ -46,6 +46,9 @@ run.sh                   sync / nginx / push / keep-push / stop / verify
 ## 构建
 
 ```bash
+# 一键入口(推荐): 串起下面三步, 等价于 fetch → build-deps → build-openresty
+scripts/setup.sh
+
 # 0) 模块 host 单测在模块仓做(不需要 nginx/第三方):
 #    git clone --depth 1 --branch v0.1.0 https://github.com/DeguiLiu/nginx-rtc-module
 #    make -C nginx-rtc-module/test run_tests
