@@ -153,7 +153,7 @@ attach_from_shm/DTLS done/owner_slot 删除、bridge 的 sync_shm/close_stream�
 | 多 worker shm 阶段 1 | HTTP 与 UDP 分属不同 worker 时 STUN 可找到 session、DTLS 可完成 |
 | stats 端点 | `/rtc/v1/stats` 输出 JSON（code=0 + streams） |
 
-验证工具：`webrtc-client/play.mjs`（werift headless 客户端，useH264/useOPUS 协商）。
+验证工具：`client/play.mjs`（werift headless 客户端，useH264/useOPUS 协商）。
 
 ## 六、待完善（后续阶段）
 

@@ -33,7 +33,7 @@ gitc() { # <url> <ref> <name>  -> shallow clone a pinned git ref into cache
 
 # Self-developed C addon (public MIT) + http-flv (RTMP core the bridge links
 # against) + opus. Bump refs here when a dependency advances.
-gitc https://github.com/DeguiLiu/nginx-rtc-module        v0.1.0 nginx-rtc-module
+gitc https://github.com/DeguiLiu/nginx-rtc-module        v0.2.0 nginx-rtc-module
 gitc https://github.com/winshining/nginx-http-flv-module v1.2.14 nginx-http-flv-module
 gitc https://github.com/xiph/opus                         v1.3.1 opus
 
