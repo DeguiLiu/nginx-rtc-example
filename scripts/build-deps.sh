@@ -46,6 +46,7 @@ cp -r "$CACHE/ffmpeg" "$SRC/ffmpeg"
 ( cd "$SRC/ffmpeg" \
     && ./configure --prefix="$THIRD" --disable-everything \
          --enable-static --disable-shared --disable-programs --disable-doc --disable-network \
+         --disable-x86asm \
          --enable-avcodec --enable-avutil --enable-swresample \
          --enable-decoder=aac --enable-decoder=aac_latm --enable-parser=aac \
          >/dev/null \
