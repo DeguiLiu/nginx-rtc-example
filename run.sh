@@ -4,8 +4,7 @@
 #
 #   ./run.sh sync|nginx|push|keep-push|stop|verify
 #
-# Instance prefix resolution: $OPENRESTY_PREFIX -> build/nginx -> ../openresty-rtmp-new/nginx
-# (the latter keeps the repo usable next to the original workspace checkout).
+# Instance prefix resolution: $OPENRESTY_PREFIX -> build/nginx.
 # RTC_CANDIDATE_IP overrides auto-detection of the candidate IP.
 set -e
 
@@ -17,7 +16,8 @@ if [ -n "${OPENRESTY_PREFIX:-}" ]; then
 elif [ -d "$BASE/build/nginx" ]; then
     ORX="$BASE/build/nginx/nginx"
 else
-    ORX="$BASE/../openresty-rtmp-new/nginx"
+    echo "nginx prefix not found: set OPENRESTY_PREFIX or run scripts/setup.sh first" >&2
+    exit 1
 fi
 
 NGX_CONF_SRC="$DEPLOY/conf/nginx.conf"
