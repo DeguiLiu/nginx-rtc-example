@@ -34,6 +34,8 @@
   th:first-child, td:first-child { text-align:left; }
   #log { font-family: monospace; font-size: 12px; background: #1e1e1e; color: #7fdbca;
          border-radius: 4px; padding: 10px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; }
+  .btn-res { background:#eef3fc; color:#1a73e8; padding:4px 12px; font-size:13px; }
+  .btn-res.on { background:#1a73e8; color:#fff; }
 </style>
 </head>
 <body>
@@ -51,6 +53,14 @@
     </div>
     <div class="row"><label>应用</label><input type="text" id="app" value="live">
       <label>流名</label><input type="text" id="stream" value="livestream">
+    </div>
+    <div class="row"><label>分辨率</label>
+      <button class="btn-res" data-r="" onclick="pickRes(this)">原画</button>
+      <button class="btn-res" data-r="1080p" onclick="pickRes(this)">1080p</button>
+      <button class="btn-res" data-r="720p" onclick="pickRes(this)">720p</button>
+      <button class="btn-res" data-r="540p" onclick="pickRes(this)">540p</button>
+      <button class="btn-res" data-r="360p" onclick="pickRes(this)">360p</button>
+      <span style="color:#888;font-size:12px">(原画=推流原始码流；其余为服务端转码档，需先启动 run.sh transcode)</span>
     </div>
     <div class="row"><label>密钥</label><input type="text" id="key" value="demo-secret-0123456789abcdef0123456789abcdef">
       <button class="btn-play" id="btnPlay" onclick="play()">▶ 播放</button>
@@ -103,6 +113,27 @@ let curTarget = null;
 
 function log(msg) { el.log.textContent += new Date().toISOString().slice(11, 19) + " " + msg + "\n"; }
 function setState(txt, cls) { el.state.innerHTML = `<span class="badge ${cls}">${txt}</span>`; }
+
+// Ladder rung quick-select: rewrites the stream name between
+// livestream / livestream_<rung> and re-plays if a session is live.
+function pickRes(btn) {
+  document.querySelectorAll(".btn-res").forEach(b => b.classList.toggle("on", b === btn));
+  const r = btn.dataset.r;
+  const st = $("stream");
+  st.value = st.value.replace(/_?(1080p|720p|540p|360p)$/, "") + (r ? "_" + r : "");
+  if (pc) play();
+}
+
+// Portal deep-link: /rtcplayer.html?s=livestream_720p presets the stream name
+// and highlights the matching ladder button.
+(function initFromQuery() {
+  const s = new URLSearchParams(location.search).get("s");
+  if (!s) { document.querySelector('.btn-res[data-r=""]').classList.add("on"); return; }
+  $("stream").value = s;
+  const r = (s.match(/_(1080p|720p|540p|360p)$/) || [, ""])[1];
+  const btn = document.querySelector(`.btn-res[data-r="${r}"]`);
+  if (btn) btn.classList.add("on");
+})();
 
 function pickHost() {
   const h = $("host").value.trim();
@@ -242,7 +273,16 @@ async function play() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sdp: offer.sdp, streamurl, api, clientip: host, t: String(tk.t), sign: tk.sign }),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => null);
+    if (!data) {
+      log(`信令返回非 JSON (HTTP ${res.status})`);
+      if (res.status === 429) log("被限流：播放请求过于频繁，等几秒再试");
+      else if (res.status === 403) log("鉴权失败：检查密钥是否正确");
+      else if (res.status === 400) log("请求被拒：SDP/流地址格式错误");
+      setState("信令失败 HTTP " + res.status, "err");
+      stop();
+      return;
+    }
     if (data.code !== 0) { log("信令错误: " + JSON.stringify(data)); setState("信令失败 code=" + data.code, "err"); stop(); return; }
     log(`[${Date.now()-t0}ms] 收到 answer SDP`);
     await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });

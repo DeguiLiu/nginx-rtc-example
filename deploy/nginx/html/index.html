@@ -20,6 +20,12 @@
     a.flv .t { color: #e8710a; } a.flv .tag { color: #e8710a; }
     .tag { display: inline-block; font-size: 11px; border: 1px solid currentColor;
            border-radius: 8px; padding: 1px 8px; margin-top: 10px; }
+    .ladder { margin-top: 26px; font-size: 13px; color: #555; }
+    .ladder a { color: #1a73e8; text-decoration: none; margin: 0 8px;
+                border: 1px solid #1a73e855; border-radius: 6px; padding: 4px 14px;
+                display: inline-block; }
+    .ladder a:hover { background: #eef3fc; }
+    .ladder .hint { color: #aaa; font-size: 11px; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -37,6 +43,15 @@
         <div class="d">nginx-http-flv 输出 · flv.js 播放<br>秒开 + GOP cache，兼容性最好</div>
         <div class="tag">亚秒 · MSE</div>
       </a>
+    </div>
+    <div class="ladder">
+      多分辨率（服务端转码档 · WebRTC 直达）：
+      <a href="/rtcplayer.html?s=livestream">原画</a>
+      <a href="/rtcplayer.html?s=livestream_1080p">1080p</a>
+      <a href="/rtcplayer.html?s=livestream_720p">720p</a>
+      <a href="/rtcplayer.html?s=livestream_540p">540p</a>
+      <a href="/rtcplayer.html?s=livestream_360p">360p</a>
+      <div class="hint">转码档需在服务端启动 ./run.sh transcode（或 keep-transcode）</div>
     </div>
   </div>
 </body>

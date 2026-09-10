@@ -3,6 +3,11 @@
 -- 线上不再传明文 key。
 return {
     ["live/livestream"] = "demo-secret-0123456789abcdef0123456789abcdef",
+    -- Multi-resolution ladder (transcoded from live/livestream by run.sh transcode).
+    ["live/livestream_1080p"] = "demo-secret-0123456789abcdef0123456789abcdef",
+    ["live/livestream_720p"] = "demo-secret-0123456789abcdef0123456789abcdef",
+    ["live/livestream_540p"] = "demo-secret-0123456789abcdef0123456789abcdef",
+    ["live/livestream_360p"] = "demo-secret-0123456789abcdef0123456789abcdef",
     ["live/whiptest"] = "demo-secret-0123456789abcdef0123456789abcdef",
     ["live/test"] = "test-secret-4567890abcdef0123456789abcdef",
     ["live/hotreload"] = "hot-secret-67890abcdef0123456789abcdef0",
