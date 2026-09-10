@@ -8,7 +8,9 @@ local config = require "config"
 ngx.log(ngx.ERR, "rtc_auth: ENTER remote=", ngx.var.remote_addr, " ct=", ngx.var.content_type, " len=", ngx.var.content_length)
 
 -- Rate limit: 30 play requests/min per client IP (leaky bucket via the
--- official lua-resty-limit-traffic, replacing the hand-rolled incr window).
+-- official lua-resty-limit-traffic). Requests within the burst allowance are
+-- served immediately; beyond burst -> 429 JSON (a plain ngx.exit(429) sends
+-- nginx's HTML error page, which breaks JSON.parse on the player side).
 local limit_req = require "resty.limit.req"
 local lim, err = limit_req.new("rate_limit", 0.5, 5)
 if not lim then
@@ -19,16 +21,16 @@ end
 local delay, err = lim:incoming(ngx.var.binary_remote_addr, true)
 if not delay then
     if err == "rejected" then
+        ngx.status = 429
+        ngx.header.content_type = "application/json"
+        ngx.say('{"code":429,"message":"rate limited: too many play requests, retry in a few seconds"}')
         return ngx.exit(429)
     end
     ngx.log(ngx.ERR, "rtc_auth: limit_req failed: ", err)
     return ngx.exit(500)
 end
-if delay >= 0.001 then
-    -- Over the 30/min rate but within burst: reject rather than delay a
-    -- signaling request (latency matters more than queueing here).
-    return ngx.exit(429)
-end
+-- delay > 0 means we are draining the burst; signaling latency budget is
+-- small, so treat it as pass-through rather than ngx.sleep(delay).
 
 ngx.req.read_body()
 local body = ngx.req.get_body_data()
