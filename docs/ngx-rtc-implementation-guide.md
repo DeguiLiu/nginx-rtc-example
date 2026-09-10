@@ -1,16 +1,14 @@
-# 自研 nginx RTC 模块技术指导文档（ngx-rtc-module）
+# ngx-rtc-module 技术指导文档
 
-## 0. 结论
+> 文档范围：在 nginx 进程内用 C 自研 RTC 模块（替代 SRS 独立服务）的完整技术指导——架构映射、各协议模块实现要点、nginx 集成机制、QoS 闭环、零拷贝与缓冲策略、风险规避。
+> 本文档整合自六份调研与设计材料（桥接挂载点分析、SRS/nginx 源码对照、设计哲学审查、独立评审、改进方向、零拷贝优化设计），去除过程性表述，只保留仍然成立的指导结论。
+> 关联代码：`ngx-rtc-module/src/`；SRS 参照：`srs-server-6.0-r1/trunk/src/`；nginx 源码：`openresty-1.31.1.1/bundle/nginx-1.31.1/`。
 
-本项目的核心创新点是**在 nginx 进程内用 C 语言自研 RTC 服务**（替代 SRS），实现 RTMP 收流 → H264 NALU 提取 → RTP/FU-A 封装 → SRTP 加密 → UDP 发送的 WebRTC 低延迟直播。基于对 SRS 6.0 RTC 源码（`/home/dgliu/workspace/webrtc/srs-server-6.0-r1/trunk/`）与 nginx 1.25.3 源码（`/home/dgliu/workspace/webrtc/openresty-1.25.3.1/bundle/nginx-1.25.3/`）的逐一比对，得出三条结论：
-
-1. **nginx 1.25.3 的 stream 模块已内置 `listen udp` 与「按对端 ip:port 复用连接」的 UDP 连接缓存**（`ngx_event_udp.c` 的 `ngx_lookup_udp_connection`/`ngx_insert_udp_connection`），`ngx_stream_session_t` 天然跨数据报持久存在——这正好承载 WebRTC 每 peer 一会话的 DTLS/SRTP 状态，无需自研 UDP 复用层。
-2. **自研工作量集中在 5 块**：RTMP 帧桥接（RTMP 模块挂 `events[MSG_VIDEO/AUDIO]`）、H264→RTP 封装（参考 `SrsRtcRtpBuilder`，src/app/srs_app_rtc_source.cpp:830-1408）、DTLS-SRTP 密钥导出（RFC 5764 `SSL_export_keying_material`）、STUN Binding 应答、SDP offer/answer。AAC→Opus 转码可后置（MVP 只做 video-only）。
-3. **密码学不重复造轮子**：DTLS 用 OpenSSL，SRTP 优先 libsrtp2（SRS 同款 `srtp_protect`/`srtp_unprotect`），只有密钥导出必须自写（`SrsDtlsImpl::get_srtp_key`，src/app/srs_app_rtc_dtls.cpp:647-676）。
+**核心定位**：本项目 = **SRS 6.0 RTC 协议栈（STUN/DTLS/SRTP/RTP/SDP/RTCP/AAC→Opus）+ `/rtc/v1/play/` 信令契约，直译进 nginx worker 进程**。在 nginx 框架内完成 RTMP 直播源到 WebRTC 播放的低延迟转换（RTMP 收流 → H264 NALU 提取 → RTP/FU-A 封装 → SRTP 加密 → UDP 发送），HTTP-FLV 分发保留作为兜底。这条路径**在开源社区无成熟先例**（nginx-rtmp 系模块均不支持 WebRTC，社区惯例是 nginx 做 RTMP/HTTP-FLV + 独立进程 SRS/Janus/mediasoup 两段式），技术依据与可借鉴先例见第 8 节。
 
 ---
 
-## 1. 总体架构与组件映射表
+## 1. 总体架构与组件映射
 
 ### 1.1 目标架构
 
@@ -20,29 +18,33 @@ flowchart LR
         A["ffmpeg / OBS<br/>RTMP :1935"]
     end
 
-    subgraph NGX["OpenResty nginx（单进程）"]
+    subgraph NGX["OpenResty nginx"]
         subgraph RTMPM["nginx-http-flv-module（RTMP 接入）"]
             B["RTMP 收流<br/>parse FLV tag"]
         end
         subgraph RTC["ngx-rtc-module（自研）"]
-            C["ngx_rtc_bridge<br/>帧桥接 + RTP 封装"]
-            D["ngx_rtc_core<br/>UDP :8000 会话分发"]
+            C["ngx_rtmp_rtc_bridge<br/>帧桥接 + RTP 封装"]
+            D["ngx_rtc_core<br/>source/session 注册表 + GOP ring"]
             E["ngx_rtc_dtls/srtp/stun<br/>DTLS·SRTP·ICE"]
-            F["ngx_rtc_api<br/>/rtc/v1/play/ 信令"]
+            F["ngx_rtc_http<br/>/rtc/v1/play/ 信令"]
+            LUA["OpenResty Lua<br/>鉴权 / 限流 / 动态配置"]
         end
     end
 
     subgraph PLAY["播放端"]
-        G["浏览器 WebRTC<br/>PC.setRemoteDescription"]
+        G["浏览器 WebRTC"]
+        HF["HTTP-FLV 播放器（兜底）"]
     end
 
     A -->|"RTMP push"| B
     B -->|"events[MSG_VIDEO/AUDIO]"| C
-    C -->|"RTP 包"| D
-    D -->|"SRTP over UDP"| G
+    C -->|"明文 RTP（源级共享）"| D
+    D -->|"每 session 重写 PT + SRTP"| E
+    E -->|"UDP :8000"| G
     G -->|"POST offer"| F
-    F -->|"answer(SDP) + ICE"| G
-    G -->|"STUN/DTLS 握手"| E
+    F -->|"access_by_lua 鉴权"| LUA
+    F -->|"answer(SDP)"| G
+    B -->|"HTTP-FLV :18082"| HF
 
     style A fill:#e8f4fd,stroke:#2196f3
     style B fill:#e8f4fd,stroke:#2196f3
@@ -50,155 +52,172 @@ flowchart LR
     style D fill:#e8f5e9,stroke:#4caf50
     style E fill:#fff3e0,stroke:#ff9800
     style F fill:#fff3e0,stroke:#ff9800
-    style G fill:#f3e5f5,stroke:#9c27b0
+    style LUA fill:#f3e5f5,stroke:#9c27b0
+    style G fill:#fce4ec,stroke:#e91e63
+    style HF fill:#e8f5e9,stroke:#4caf50
 ```
+
+**边界原则**（分工红线）：
+
+- **信令与控制面**：OpenResty Lua——鉴权、限流、信令路由、动态配置热加载（`lua_shared_dict` + `ngx.timer.every`）。
+- **媒体面与协议栈**：纯 C nginx 模块，参考 SRS 逐项实现。**媒体协议栈不能下放 Lua**（无 `lua-resty-webrtc/sdp/dtls/srtp` 可用模块，纯 Lua 拼 SFU 的成本与可靠性不可控）。
+- **跨 worker 共享状态**：`ngx_shm_zone` + `ngx_slab_pool`，见第 7 节。
 
 ### 1.2 SRS → nginx 自研模块映射表
 
-| SRS 6.0 组件（源码文件） | nginx 自研模块/文件 | 职责 | 依赖 |
-| --- | --- | --- | --- |
-| `SrsFrameToRtcBridge` + `SrsCompositeBridge`（srs_app_stream_bridge.cpp:66-158,231） | `ngx_rtc_bridge.c`（`NGX_RTMP_MODULE`） | 订阅 RTMP 音视频帧，按流创建 RTC 源，驱动 RTP 封装 | nginx-http-flv-module 的 `events[]` 钩子、ngx_rtc_source |
-| `SrsRtcSource` / `SrsRtcSourceManager`（srs_app_rtc_source.cpp:326,554,732） | `ngx_rtc_source.c` | 每流一个源：保存 SPS/PPS、SSRC/PT、消费者列表，广播 RTP 包 | 共享内存/红黑树（跨模块进程内） |
-| `SrsRtcRtpBuilder`（srs_app_rtc_source.cpp:830-1408） | `ngx_rtc_rtp.c` | H264 NALU → single/STAP-A/FU-A，AAC→Opus 后置 | ngx_rtc_source、FLV tag 解析 |
-| `SrsRtpHeader` / `SrsRtpPacket`（srs_kernel_rtc_rtp.cpp:537-942） | `ngx_rtc_rtp.c`（同文件） | RTP 头 12 字节编解码、payload 编解码 | 无 |
-| `SrsAudioTranscoder`（srs_app_rtc_codec.cpp:140-467） | `ngx_rtc_transcode.c` | AAC→Opus（FFmpeg libavcodec/libswresample），**MVP 后置** | libavcodec/libswresample |
-| `SrsDtlsImpl` / `SrsSRTP`（srs_app_rtc_dtls.cpp:461-1074） | `ngx_rtc_dtls.c` + `ngx_rtc_srtp.c` | DTLS 握手、SRTP 密钥导出、加解密 | OpenSSL、libsrtp2 |
-| `SrsRtcUdpNetwork` STUN 部分（srs_app_rtc_network.cpp:363-436） | `ngx_rtc_stun.c` | STUN Binding Request→Response、ICE candidate | ngx_rtc_core |
-| `SrsSdp` / `negotiate_play_capability`（srs_app_rtc_sdp.cpp:763-830；srs_app_rtc_conn.cpp:3075-3237） | `ngx_rtc_sdp.c` | SDP offer 解析、answer 生成、PT/SSRC 协商 | ngx_rtc_source |
-| `SrsRtcServer` / `SrsRtcConnection`（srs_app_rtc_server.cpp:337-456,497-623；srs_app_rtc_conn.cpp:2056-2593） | `ngx_rtc_core.c`（`NGX_STREAM_MODULE`） | UDP listen、会话注册表（username/ssrc/peer）、包分发、发送 | stream 框架、其余全部 |
-| `SrsGoApiRtcPlay`（srs_app_rtc_api.cpp:52-278） | `ngx_rtc_api.c`（`NGX_HTTP_MODULE`） | `POST /rtc/v1/play/`：解析 offer → 建会话 → 返回 answer | ngx_rtc_core、ngx_rtc_sdp |
+| SRS 6.0 组件（源码位置） | nginx 自研模块/文件 | 职责 |
+| --- | --- | --- |
+| `SrsFrameToRtcBridge`（srs_app_stream_bridge.cpp:66-158） | `ngx_rtmp_rtc_bridge_module.c`（`NGX_RTMP_MODULE`） | 订阅 RTMP 音视频帧，按流创建 RTC 源，驱动 RTP 封装 |
+| `SrsRtcSource`（srs_app_rtc_source.cpp:326,554,732） | `ngx_rtc_core.c` | 每流一个源：SPS/PPS、SSRC/PT、订阅者队列、GOP ring |
+| `SrsRtcRtpBuilder`（srs_app_rtc_source.cpp:830-1408） | `ngx_rtc_rtp.c` | H264 NALU → single/STAP-A/FU-A，B 帧过滤 |
+| `SrsRtpHeader`/`SrsRtpPacket`（srs_kernel_rtc_rtp.cpp:537-942） | `ngx_rtc_rtp.c`（同文件） | RTP 头 12 字节编解码 |
+| `SrsAudioTranscoder`（srs_app_rtc_codec.cpp:140-467） | `ngx_rtc_audio.c` | AAC→Opus（FFmpeg aac + libswresample + libopus） |
+| `SrsDtlsImpl`/`SrsSRTP`（srs_app_rtc_dtls.cpp:461-1074） | `ngx_rtc_dtls.c` + `ngx_rtc_srtp.c` | DTLS 握手、SRTP 密钥导出、加解密 |
+| `SrsRtcUdpNetwork` STUN 部分（srs_app_rtc_network.cpp:363-436） | `ngx_rtc_stun.c` | STUN Binding Request→Response、ICE |
+| `SrsSdp`/`negotiate_play_capability`（srs_app_rtc_sdp.cpp:763-830） | `ngx_rtc_sdp.c` | SDP offer 解析、answer 生成、PT/SSRC 协商 |
+| `SrsRtcServer`/`SrsRtcConnection`（srs_app_rtc_server.cpp:337-623） | `ngx_rtc_stream_module.c`（`NGX_STREAM_MODULE`） | UDP listen、会话注册表、包分发、发送 |
+| `SrsGoApiRtcPlay`（srs_app_rtc_api.cpp:52-278） | `ngx_rtc_http_module.c`（`NGX_HTTP_MODULE`） | `POST /rtc/v1/play/`：解析 offer → 建 session → 返回 answer |
 
-> 说明：与 SRS 多线程协程不同，nginx 是**单进程事件循环 + 分阶段（phase）回调**。上表每个「模块」编译进同一个 `ngx-rtc-module` addon，通过 nginx 的 `config` 脚本一次 `--add-module` 引入；非 nginx 模块的辅助文件（rtp/sdp/stun/source/transcode）作为普通 C 源文件链接进对应模块。
+> 与 SRS 多线程协程不同，nginx 是**单进程事件循环 + 分阶段回调**。非 nginx 模块的协议单元（rtp/sdp/stun/dtls/srtp/audio/rtcp/hsm）作为普通 C 源文件链接进 addon，不引用 nginx 头文件、无全局可变状态，可脱离 nginx 在 host 上单测。
+
+### 1.3 模块拆分与测试边界
+
+| 模块 | 依赖 nginx | 可单测 |
+| --- | --- | --- |
+| `rtp`（AVCC→NALU、RFC 6184 打包）、`sdp`、`stun`、`rtcp`、`hsm`/`session_fsm` | 否 | 是 |
+| `srtp`（libsrtp2 封装）、`dtls`（OpenSSL wrapper） | 否（链第三方库） | 是（真实库或 mock） |
+| `audio`（AAC→Opus）、`core`（source/session 注册表） | 部分（注册表用 ngx_rbtree/ngx_queue） | audio 是 / core 否 |
+| `ngx_rtmp_rtc_bridge_module`、`ngx_rtc_http_module`、`ngx_rtc_stream_module` | 是 | 否（薄胶水层） |
+
+原则：**逻辑下沉到纯 C 模块，nginx 侧只做事件/配置/socket 翻译**。纯 C 单测用 host CMake + TDD（RED→GREEN→REFACTOR），RFC 位级代码（STUN 长度边界、FU-A 位级、SDP 解析）必须有单测覆盖，端到端测试只数包不校验语义，不足以暴露这类缺陷。
 
 ---
 
-## 2. 各模块实现要点
+## 2. 桥接挂载点（RTMP 侧）
 
-### 2.1 RTMP→RTC 桥接（ngx_rtc_bridge，RTMP 模块）
+**结论**：在**新 RTMP 模块**的 `postconfiguration` 中，把处理器注册到 `cmcf->events[NGX_RTMP_MSG_AUDIO]` 与 `events[NGX_RTMP_MSG_VIDEO]`，与 `ngx_rtmp_gop_cache_av`（ngx_rtmp_gop_cache_module.c:804）、`ngx_rtmp_codec_av`（ngx_rtmp_codec_module.c:194）同一模式。该挂载点**不改动** `ngx_rtmp_live_module.c`、GOP 缓存、HTTP-FLV 分发逻辑。
 
-SRS 参考：`SrsFrameToRtcBridge`（srs_app_stream_bridge.cpp:66-158）、挂载点 `SrsRtmpConn::start_publish`（srs_app_rtmp_conn.cpp:1122-1138）。
+```mermaid
+flowchart LR
+    subgraph RTMP["nginx RTMP (自研 RTC 模块挂载点)"]
+        A[chunk 重组] --> B[ngx_rtmp_receive_message]
+        B --> C[codec_av 解析序列头]
+        B --> D[gop_cache_av 缓存 GOP]
+        B --> E[rtc_av 桥接钩子]
+        B --> F[live_av 分发]
+        E --> G[RTC 源队列 / RTP 封装]
+    end
+    subgraph UDP["nginx stream UDP"]
+        H[recvmsg] --> I[ngx_stream_session]
+        I --> J[content phase handler]
+        J --> K[STUN/DTLS/SRTP]
+        G -.SRTP/RTP 推送.-> K
+        K -.UDP.-> L[浏览器]
+    end
+    style E fill:#e8f5e9,stroke:#4caf50
+    style G fill:#e8f5e9,stroke:#4caf50
+    style K fill:#fff3e0,stroke:#ff9800
+```
 
-nginx 侧的等价钩子是 nginx-http-flv-module 的**原始消息事件表** `cmcf->events[NGX_RTMP_MSG_VIDEO/AUDIO]`（分发逻辑 `ngx_rtmp_receive_message`，ngx_rtmp_handler.c:792-849），以及 `ngx_rtmp_publish` / `ngx_rtmp_close_stream` 链（链式挂接范例 ngx_rtmp_live_module.c:1643-1647）。
+关键事实：
 
-关键实现细节：
+1. **钩子内拿到的 `(s, h, in)` 即解析完成的 H264/AAC 帧**：`in` 为 FLV tag body，`pos[0]` 是帧类型字节、`pos[1]` 是 PacketType 字节；序列头（SPS/PPS/AudioSpecificConfig）从 `ngx_rtmp_codec_module` 的 ctx 读取。
+2. **publish/close_stream 链式挂接**：`next_publish = ngx_rtmp_publish; ngx_rtmp_publish = ngx_rtc_publish;`（范例 ngx_rtmp_live_module.c:1643-1647），publish 回调里按 `app/name` 找到或创建 source，close_stream 回调里清理 source 与订阅者。
+3. **SRS 的思路本质一致**："在 RTMP source 上挂 bridge，逐帧分叉到 RTC source"（srs_app_rtmp_conn.cpp:1122-1139 的 `SrsCompositeBridge` + `SrsFrameToRtcBridge`），本项目换成"在 publisher 帧上挂事件钩子"。
+4. **桥接模块只做「取帧 + 判断音视频 + 转交封装」**，不做 RTP 细节，保持单一职责。
 
-1. **postconfiguration 里做两件事**：向 `cmcf->events[NGX_RTMP_MSG_VIDEO]` 和 `events[NGX_RTMP_MSG_AUDIO]` 各 push 一个 `ngx_rtmp_handler_pt`；再链住 `next_publish = ngx_rtmp_publish; ngx_rtmp_publish = ngx_rtc_publish;`（对照 SRS 在 publish 时 `bridge->append(new SrsFrameToRtcBridge(rtc))`，srs_app_rtmp_conn.cpp:1130）。
-2. **publish 回调**里按 `app/name` 找到或创建 `ngx_rtc_source_t`，保存请求信息；SRS 对应 `_srs_rtc_sources->fetch_or_create(req, rtc)`（srs_app_rtmp_conn.cpp:1094）。
-3. **video/audio 事件回调**里拿到 FLV tag 原始 payload：`h->timestamp` 即毫秒时间戳，`in->buf` 是 tag 体。视频 tag 结构为 `1B FrameType|CodecID + 1B AVCPacketType + 3B CompositionTime + NALUs`，`AVCPacketType==0` 是 sequence header（SPS/PPS），`==1` 是普通帧——SRS 用 `SrsFlvVideo::sh()` 判断 sequence header（srs_app_rtc_source.cpp:1059）。
-4. **GOP 缓存 SPS/PPS**：sequence header 到达时解析出 SPS/PPS 存进源，供每个 IDR 前拼 STAP-A——SRS `SrsMetaCache::update_vsh`（srs_app_rtc_source.cpp:1060）。
-5. **close_stream 回调**里清理源与消费者——SRS `SrsFrameToRtcBridge::on_unpublish`（srs_app_stream_bridge.cpp:134-143）。
+关键行号索引（nginx-http-flv-module）：
 
-> 桥接模块只做「取帧 + 判断音视频 + 转交封装」，不做 RTP 细节，保持单一职责。
+| 符号 | 位置 |
+| --- | --- |
+| `ngx_rtmp_receive_message`（事件分发循环） | `ngx_rtmp_handler.c:792-849` |
+| `ngx_rtmp_fire_event` | `ngx_rtmp.c:1072-1090` |
+| `ngx_rtmp_codec_av` / parse avc/aac header | `ngx_rtmp_codec_module.c:194-584` |
+| `ngx_rtmp_gop_cache_av`（publisher 帧钩子范本） | `ngx_rtmp_gop_cache_module.c:804-855` |
+| `ngx_rtmp_live_av`（直播分发） | `ngx_rtmp_live_module.c:849-1233` |
+| 事件 handler 类型 / events 数组 | `ngx_rtmp.h:419-420` / `:432` |
+| 模块加载顺序（codec 在 live 之前） | addon `config` 的 `RTMP_CORE_MODULES` |
 
-### 2.2 H264 → RTP 封装（ngx_rtc_rtp）
+---
 
-SRS 参考：`SrsRtcRtpBuilder`（srs_app_rtc_source.cpp:830-1408）与 `SrsRtpHeader`/`SrsRtpPacket`/`SrsRtpFUAPayload2`（srs_kernel_rtc_rtp.cpp:537-942,1455-1527）。
+## 3. 协议模块实现要点
 
-关键实现细节（含常量）：
+### 3.1 H264 → RTP 封装（`ngx_rtc_rtp`）
 
-1. **NALU 提取与 B 帧过滤**：按 AVCC 长度前缀切 NALU；`keep_bframe=false` 时丢弃 B 帧（解析 slice_type），SEI 可选丢——SRS `SrsRtcRtpBuilder::filter`（srs_app_rtc_source.cpp:1131-1172）。**常量用固定宽度整型**：`kNalTypeMask=0x1F`。
-2. **IDR 前拼 STAP-A（SPS+PPS）**：检测到 IDR（`has_idr`）先发一个 STAP-A 包（type=24），把缓存的 SPS/PPS 装入——SRS `package_stap_a`（srs_app_rtc_source.cpp:1174-1231）。
-3. **单 NALU 直接打包**（`sample->size <= kRtpMaxPayloadSize`，即 1200 字节）：payload 为裸 NALU——SRS `package_single_nalu`（srs_app_rtc_source.cpp:1323-1345）。
-4. **超长 NALU 切 FU-A**（type=28）：首字节拆成 FU indicator（`28 | (nri & ~0x1F)`）与 FU header（`type | S(0x80) | E(0x40)`），每片负载 `kRtpMaxPayloadSize=1200`——SRS `package_fu_a`（srs_app_rtc_source.cpp:1347-1387）、`SrsRtpFUAPayload2::encode`（srs_kernel_rtc_rtp.cpp:1455-1486）。
-5. **RTP 头字段**：PT=102、SSRC=视频源 SSRC、`timestamp = FLV时间戳ms × 90`、sequence 自增、**最后一个分片的 marker=1**——SRS `on_video`（srs_app_rtc_source.cpp:1054-1128）与 `SrsRtpHeader::encode`（srs_kernel_rtc_rtp.cpp:608-652）。
+SRS 参考：`SrsRtcRtpBuilder`（srs_app_rtc_source.cpp:830-1408）。
 
-> 常量清单：`kRtpMaxPayloadSize=1200`（=1500−300，srs_app_rtc_source.cpp:72）、`kRtpPacketSize=1500`（srs_kernel_rtc_rtp.hpp:22）、`kVideoPayloadType=102`、`kAudioPayloadType=111`（srs_app_rtc_source.hpp:48,50）。
+1. **NALU 提取与 B 帧过滤**：按 AVCC 长度前缀切 NALU；解析 slice_type 判断 B 帧，WebRTC 低延迟播放不支持 B 帧，过滤在 NALU 切分后、RTP 封装前做（srs_app_rtc_source.cpp:1131-1172）。
+2. **IDR 前拼 STAP-A（SPS+PPS）**：检测到 IDR 先发 type=24 的 STAP-A 包，装入缓存的 SPS/PPS（`package_stap_a`，srs_app_rtc_source.cpp:1174-1231）。
+3. **单 NALU 直接打包**（≤1200 字节）、**超长 NALU 切 FU-A**（type=28，首字节拆 FU indicator `28|(nri&~0x1F)` + FU header `type|S(0x80)|E(0x40)`，每片 1200 字节）。
+4. **RTP 头**：PT=协商值（见 3.6）、SSRC=源 SSRC、`timestamp = FLV毫秒 × 90`、seq 自增、**末分片 marker=1**。
+5. **常量**：`kRtpMaxPayloadSize=1200`（=1500−300）、NAL type mask `0x1F`，全部用固定宽度整型。
 
-### 2.3 AAC→Opus 转码（ngx_rtc_transcode，MVP 后置）
+### 3.2 AAC → Opus 转码（`ngx_rtc_audio`）
 
-SRS 参考：`SrsAudioTranscoder`（srs_app_rtc_codec.cpp:87-467），触发点在 `SrsRtcRtpBuilder::on_audio`（srs_app_rtc_source.cpp:908-968）。
+SRS 参考：`SrsAudioTranscoder`（srs_app_rtc_codec.cpp:87-467）。
 
-关键实现细节：
+1. **FFmpeg 管线**：`aac` 解码 → `swr_convert` 重采样到 48kHz/2ch（经 `av_audio_fifo`）→ libopus 编码。
+2. **FLV AAC tag 转 ADTS**：解码器吃 ADTS 头，从 AAC sequence header（AudioSpecificConfig）构造 7 字节 ADTS。
+3. **Opus 帧打包**：PT=111、`timestamp = dts_ms × 48`、marker 恒真、一帧一包。**时间戳必须源级单调计数、每成功 emit 一帧 `+960`**——AAC 帧 1024 样本（21.33ms）与 Opus 帧 960 样本（20ms）不对齐，FIFO 会周期性多出一帧，若复用 AAC tag 时间戳会产生"多帧同 ts"，客户端 jitter buffer 去重后表现为规律性卡顿。
+4. **编码器配置**：`compression_level=1`、`opus_delay=25`（延迟优先）。
+5. **线程隔离**：FFmpeg 转码是 CPU 密集操作，不能长期同步跑在 nginx 事件循环内——多路推流时会互相挤压。方案是独立 pthread（每路一个，独占 FFmpeg 上下文）+ 有界环与主循环交换帧，参考 nginx-srt-module 的"side thread + eventfd 通知"模式（见第 8 节）。
 
-1. **FFmpeg 解码+编码管线**：`avcodec_find_decoder("aac")` → `avcodec_open2` → 每帧 `avcodec_send_packet`/`avcodec_receive_frame`；编码侧 `libopus`，输出 48kHz/2ch——SRS `init_dec`/`init_enc`（srs_app_rtc_codec.cpp:196-282）。
-2. **重采样**：AAC 采样率（如 44100）→ 48000 用 `swr_convert`，结果先进 `av_audio_fifo`——SRS `init_swr`（284-315）、`decode_and_resample`（325-377）。
-3. **Opus 帧打包**：Opus 输出 PT=111，`timestamp = dts_ms × 48`，marker 恒真——SRS `package_opus`（srs_app_rtc_source.cpp:1033-1052）。
-4. **FLV AAC tag 转 ADTS**：解码器吃 ADTS 头，需要从 AAC sequence header（AudioSpecificConfig）构造 7 字节 ADTS——SRS `aac_raw_append_adts_header`（调用点 srs_app_rtc_source.cpp:949）。
-5. **Opus 编码器配置**：`compression_level=1`、`strict_std_compliance=FF_COMPLIANCE_EXPERIMENTAL`、`opus_delay=25`（延迟优先）——SRS `init_enc`（srs_app_rtc_codec.cpp:246-253）。
+### 3.3 DTLS 握手与 SRTP 密钥导出（`ngx_rtc_dtls`）
 
-> MVP 阶段此模块整体后置：先 video-only，音频转码作为第二步叠加。
+SRS 参考：`SrsDtlsImpl`（srs_app_rtc_dtls.cpp:461-676）。
 
-### 2.4 DTLS 握手与 SRTP 密钥导出（ngx_rtc_dtls）
+1. **SSL_CTX 进程级单例**：`SSL_CTX_new(DTLS_method())` + `SSL_CTX_set_tlsext_use_srtp(ctx, "SRTP_AES128_CM_SHA1_80")`（声明 use_srtp 是密钥导出的前提）。
+2. **每会话内存 BIO**（非 socket BIO，nginx 事件模型不允许阻塞 IO）：`SSL_new` → `BIO_s_mem()` in/out → out BIO 挂 write 回调经 UDP 发出（必须用 callback 而非 `BIO_get_mem_data`，否则 MTU 分片处理不对）。
+3. **服务端必须显式 `SSL_set_accept_state(ssl)`**——OpenSSL 不会因 `DTLS_server_method()` 自动进入 accept 状态，漏掉报 `ssl_read_internal:uninitialized`，握手无感知失败。
+4. **角色由 SDP `a=setup` 决定**：offer 默认 `actpass` → answer 取 `passive`（server）；收包流程 `BIO_write(in) → SSL_read → SSL_is_init_finished()`。
+5. **密钥导出（RFC 5764 use_srtp，最核心的自写代码）**：握手完成后 `SSL_export_keying_material(dtls, material, 60, "EXTRACTOR-dtls_srtp", ...)`，前 30 字节 client key(16)+salt(14)、后 30 字节 server 的，按自身角色分配 recv/send。
+6. **健壮性**：握手需要超时重传驱动（`DTLSv1_handle_timeout` + `ngx_add_timer`），不能只靠会话空闲回收兜底；首包可用 `DTLSv1_listen()` + HelloVerifyRequest cookie（HMAC-SHA1 绑定客户端地址）做无状态反欺骗——两者均来自 nginx 官方 2018 stream DTLS patch（未合并，见第 8 节）。
 
-SRS 参考：`SrsDtlsImpl`（srs_app_rtc_dtls.cpp:461-676）、`SrsDtls::initialize`（922-932）。
-
-关键实现细节：
-
-1. **SSL_CTX 一次性构建**（进程级单例，复用给所有会话）：`SSL_CTX_new(DTLS_method())`，必须 `SSL_CTX_set_tlsext_use_srtp(ctx, "SRTP_AES128_CM_SHA1_80")` 声明 use_srtp——SRS `srs_build_dtls_ctx`（srs_app_rtc_dtls.cpp:181-182）。
-2. **每会话用内存 BIO**（非 socket BIO，nginx 事件模型不允许阻塞 IO）：`SSL_new(dtls_ctx)` → 设 `BIO_s_mem()` 的 in/out → `SSL_set_bio`，并在 out BIO 上挂 write 回调把密文经 UDP 发出——SRS `SrsDtlsImpl::initialize`（srs_app_rtc_dtls.cpp:473-528，注释特别强调必须用 callback 而非 `BIO_get_mem_data` 以正确处理 MTU 分片）。
-3. **MTU 控制**：`SSL_set_mtu(dtls, 1200)` + `DTLS_set_link_mtu(dtls, 1200)`，避免握手分片超 UDP 负载——SRS（srs_app_rtc_dtls.cpp:485-488）。
-4. **角色**：服务端（我们）是 DTLS server 还是 client 由 SDP `a=setup` 决定；offer 默认 `actpass` → answer 取 `passive`（server 端）——SRS `do_create_session`（srs_app_rtc_server.cpp:595-607）。收包流程：`BIO_write(in, data)` → `SSL_read` 消费 → `SSL_is_init_finished()` 判断完成——SRS `do_on_dtls`（srs_app_rtc_dtls.cpp:570-619）。
-5. **密钥导出（RFC 5764 use_srtp，本模块最核心的自写代码）**：握手完成后调 `SSL_export_keying_material(dtls, material, 60, "EXTRACTOR-dtls_srtp", ...)`，前 30 字节是 client 的 key(16)+salt(14)，后 30 字节是 server 的；再按自身是 client 还是 server 决定 recv_key/send_key——SRS `get_srtp_key`（srs_app_rtc_dtls.cpp:647-676）。
-
-### 2.5 SRTP 加解密（ngx_rtc_srtp）
+### 3.4 SRTP（`ngx_rtc_srtp`）
 
 SRS 参考：`SrsSRTP`（srs_app_rtc_dtls.cpp:949-1074）。
 
-关键实现细节：
+1. **用 libsrtp2，不自研**：自研 RFC 3711 需实现 KDF/ROC/重放窗/RTCP index，与浏览器互通风险高。策略固定 `aes_cm_128_hmac_sha1_80`（RTP 与 RTCP 同）、`window_size=8192`、`allow_repeat_tx=1`（NACK 重传需要）。
+2. **每会话两个 context**（recv=ssrc_any_inbound、send=ssrc_any_outbound），发送 `srtp_protect(send_ctx,...)`、接收 `srtp_unprotect(recv_ctx,...)`；libsrtp2 就地加解密，`len` 入参明文长、出参密文长。
+3. **发送顺序**：明文 RTP encode → protect → UDP write；**DTLS 完成前不发送**（send_ctx 未就绪直接返回）。
+4. **RTCP 同理**：SRTCP 也要 protect/unprotect（`srtp_protect_rtp` 对应 `srtp_protect_rtcp`），这是接收 NACK/PLI/RR/BYE 反馈的前提。
 
-1. **方案选择**：优先 libsrtp2（SRS 同款），避免自研 AES-CTR + HMAC-SHA1 的密码学风险；只 `srtp_create` 两个 context（recv=ssrc_any_inbound、send=ssrc_any_outbound）。
-2. **策略固定**：`srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80`（RTP 与 RTCP 都用），`window_size=8192`、`allow_repeat_tx=1`——SRS `SrsSRTP::initialize`（srs_app_rtc_dtls.cpp:966-1003）。
-3. **加密在发包前、解密在收包后**：发送 `srtp_protect(send_ctx, buf, &len)`，接收 `srtp_unprotect(recv_ctx, buf, &len)`——SRS `protect_rtp`/`unprotect_rtp`（1008-1057）。注意 libsrtp2 就地加解密，`len` 入参为明文长、出参为密文长。
-4. **发送顺序**：先 `SrsRtpPacket::encode` 成明文字节，再 `protect_rtp`，最后 UDP write——SRS `SrsRtcConnection::do_send_packet`（srs_app_rtc_conn.cpp:2504-2549）。
-5. **DTLS 完成前不发送**：send_ctx 未就绪时保护失败直接返回——SRS `protect_rtp` 的 `if (!send_ctx_)`（srs_app_rtc_dtls.cpp:1013-1015）。
+### 3.5 STUN / ICE（`ngx_rtc_stun`）
 
-### 2.6 STUN / ICE（ngx_rtc_stun）
+SRS 参考：`srs_app_rtc_network.cpp:363-427`、`srs_app_rtc_server.cpp:369-456`。
 
-SRS 参考：`SrsRtcUdpNetwork::on_stun`/`on_binding_request`（srs_app_rtc_network.cpp:363-427）、`SrsRtcServer::on_udp_packet` 的分发（srs_app_rtc_server.cpp:369-456）。
+1. **包类型判别**（UDP 收包入口）：STUN（首字节前 2 bit==00 且 `0x2112` magic）→ DTLS（首字节 20-23）→ RTP/RTCP。
+2. **Binding Request → Response**：message-type 换 BindingResponse、原样带回 transaction id、`mapped_address` 填对端 ip:port、本地 ice-pwd 做 MESSAGE-INTEGRITY。
+3. **会话匹配靠 username 中的 ufrag**：标准写法 `client_ufrag:server_ufrag`，但实测 werift 发的是 `server_ufrag:client_ufrag`（服务端 ufrag 在前）——匹配逻辑要按实际客户端行为取对半。
+4. **对端地址刷新**：每收一个 Binding Request 更新该会话的 peer ip:port（NAT 换端口场景）。
+5. **编码安全**：BindingResponse 编码器必须对输出缓冲做边界检查（解码侧放宽的 ufrag 长度可达 63 字节，固定 128 字节栈缓冲会被 USERNAME 属性撑爆，越界写栈可被任意持合法 ufrag 的客户端触发）。
 
-关键实现细节：
+### 3.6 SDP offer 解析 / answer 生成（`ngx_rtc_sdp`）
 
-1. **区分包类型**：UDP 收包先判 STUN（首字节前 2 bit==00 且 `0x2112` magic）、再判 DTLS（首字节 20-23）、再判 RTP/RTCP——SRS 用 `srs_is_stun`/`srs_is_dtls`/`srs_is_rtp_or_rtcp`（srs_app_rtc_server.cpp:375-376,394,450）。
-2. **Binding Request → Response**：回包 message-type=BindingResponse、`local_ufrag=r->remote_ufrag`、`remote_ufrag=r->local_ufrag`、原样带回 transaction id、`mapped_address/mapped_port` 填对端 ip:port，并用本地 ice-pwd 做 MESSAGE-INTEGRITY——SRS `on_binding_request`（srs_app_rtc_network.cpp:388-427）。
-3. **用户名校验**：STUN username 形如 `local_ufrag:remote_ufrag`，服务端凭此在注册表找会话（会话创建时用 `local_ufrag + ":" + remote_ufrag` 注册）——SRS `do_create_session`（srs_app_rtc_server.cpp:549-557）与 `find_session_by_username`（625-629）。
-4. **对端地址刷新**：每收一个 Binding Request 就更新该会话的 peer ip:port（ICE 打洞/NAT 换端口）——SRS `update_sendonly_socket`（srs_app_rtc_network.cpp:315-361）。
-5. **状态机**：`WaitingSTun → Dtls` 由第一个有效 Binding Request 触发，随后 `start_active_handshake`——SRS（srs_app_rtc_network.cpp:412-419）。ice-lite 模式下 peer 必须 `ice-controlling`，出现 `ice-controlled` 拒绝——SRS `on_binding_request`（srs_app_rtc_conn.cpp:2576-2593）。
+SRS 参考：`srs_app_rtc_sdp.cpp:763-830`、`srs_app_rtc_conn.cpp:3075-3314`。
 
-### 2.7 SDP offer 解析 / answer 生成（ngx_rtc_sdp）
+1. **offer 必须满足**：`group:BUNDLE`、media 只含 audio/video、每个 media 有 `rtcp-mux`、play 方向 `sendrecv/recvonly`。
+2. **解析出**：ice-ufrag/pwd、fingerprint、setup、mid、rtpmap、fmtp（H264 需 `profile-level-id` + `packetization-mode=1`）。**单 media 的 PT 上限要给足**：Chrome 一个 m-line 可列 20+ 个 codec（VP8/VP9/H264/AV1 + rtx + red），上限太小直接信令 400。
+3. **协商 PT**：**用 offer 的 PT 覆盖源 PT**（不能固定写死），SSRC 由服务端重新生成。
+4. **answer 生成**：m 行对齐 offer 的媒体集合（子集关系，RFC 3264）、`a=mid` 对齐、play 场景方向 `a=sendonly`、ice-ufrag/pwd、fingerprint、setup 角色互补、**media 级 `a=candidate`**（缺失时 werift 不会发起 STUN，表现为信令成功零媒体）。
+5. **rtcp-fb 声明**：若实现了 NACK/PLI 处理，answer 必须带 `a=rtcp-fb:<pt> nack` 与 `a=rtcp-fb:<pt> nack pli`——NACK/PLI 仅在 offer 与 answer 双方声明时生效，不声明则反馈链路休眠。
 
-SRS 参考：`SrsSdp::parse/encode`（srs_app_rtc_sdp.cpp:763-830）、`SrsSessionInfo::parse_attribute`（103-162）、`negotiate_play_capability`（srs_app_rtc_conn.cpp:3075-3237）、`generate_play_local_sdp`（3289-3314）。
+### 3.7 HTTP 信令（`ngx_rtc_http_module`）
 
-关键实现细节：
+SRS 参考：`SrsGoApiRtcPlay`（srs_app_rtc_api.cpp:52-278）。
 
-1. **offer 必须满足**：`group:BUNDLE`、media 只有 audio/video、每个 media 有 `rtcp-mux`、play 场景方向为 `sendrecv/recvonly`——SRS `check_remote_sdp`（srs_app_rtc_api.cpp:280-307）。
-2. **解析出**：`a=ice-ufrag`/`a=ice-pwd`/`a=fingerprint`/`a=setup`/`a=mid`/`a=rtpmap`/`a=fmtp`（H264 需 `profile-level-id` 与 `packetization-mode=1`）——SRS `SrsSessionInfo::parse_attribute`（103-119）、`srs_parse_h264_fmtp`（srs_app_rtc_sdp.cpp:56-89）。
-3. **协商 PT 与 SSRC**：从 offer 的 video media 选 H264 payload（优先 42e01f profile），**用 offer 的 PT 覆盖源 PT**（`track->media_->pt_ = remote_payload.payload_type_`），SSRC 由服务端重新生成（不能复用推流端 SSRC）——SRS `negotiate_play_capability`（3156-3175,3191,3220）。
-4. **answer 生成**：逐 media 回 `m=video 9 UDP/TLS/RTP/SAVPF <pt>`，`a=mid` 对齐 offer，方向 `a=sendonly`，`a=ice-ufrag/pwd`、`a=fingerprint:sha-256 <证书指纹>`、`a=setup:<角色>`、`a=candidate`——SRS `video_track_generate_play_offer`（3239-3287）、`do_create_session` 的指纹/candidate 填充（srs_app_rtc_server.cpp:560-588）。
-5. **DTLS 角色协商**：offer `setup` 为 actpass/active/passive 时，answer 分别取 passive/passive/active——SRS `do_create_session`（srs_app_rtc_server.cpp:595-607）。
-
-### 2.8 UDP 会话管理与分发（ngx_rtc_core，stream 模块）
-
-SRS 参考：`SrsRtcServer::on_udp_packet`（srs_app_rtc_server.cpp:369-456）、`SrsRtcConnection::initialize`/`on_dtls_handshake_done`（srs_app_rtc_conn.cpp:2056-2080,2253-2290）。
-
-关键实现细节：
-
-1. **会话注册表三级索引**：`username`（STUN 阶段）、`peer ip:port`（nginx 的 UDP 连接缓存天然提供）、`SSRC`（RTP 阶段找 publisher/player）——SRS 分别用 `_srs_rtc_manager->add_with_name/find_by_fast_id/find_by_id`（srs_app_rtc_server.cpp:378-386,620）与 `publishers_ssrc_map_`（srs_app_rtc_conn.cpp:2243）。
-2. **每数据报的分发逻辑**（在 stream content 阶段实现）：判 STUN→on_stun；DTLS→on_dtls；RTP→unprotect 后 on_rtp；RTCP→unprotect 后 on_rtcp——SRS `on_udp_packet`（srs_app_rtc_server.cpp:394-455）。
-3. **DTLS 完成回调**里启动所有 player 的发送循环（开始把 RTC 源的 RTP 队列灌给 SRTP）——SRS `on_dtls_handshake_done`（srs_app_rtc_conn.cpp:2253-2290）。
-4. **超时与保活**：记录 `last_stun_time`，`session_timeout`（默认 STUN 超时）内无包则销毁——SRS `is_alive`/`alive`（srs_app_rtc_conn.cpp:2309-2317）与 `on_timer`（srs_app_rtc_server.cpp:631）。
-5. **发送**：直接 `c->send(c, buf, len)`（UDP 连接已设 `c->send = ngx_udp_send`），且 `ngx_rtc_core` 应在 `listen udp` 的 `ls->handler` 流程后把自己注册为 content handler，避免默认 finalize 关闭会话。
+1. 契约兼容 SRS：`POST /rtc/v1/play/`，body `{"sdp":"<offer>","streamurl":"rtmp://.../app/stream"}`，返回 `{"code":0,"sdp":"<answer>","sessionid":"<username>"}`——直接复用 SRS 系 werift/前端播放器。
+2. **鉴权在 Lua access 阶段**（`access_by_lua_file` 做 stream key 校验 + `resty.limit.count` 限流），C 模块只做 content 阶段的 offer 解析与 answer 生成。
+3. **session 必须跨 request 存活**：返回 answer 后还要在 UDP 侧完成 DTLS/SRTP，session 对象用 `ngx_alloc` 从进程堆分配并挂全局注册表，**绝不能用 `r->pool`**（请求结束即销毁，后续 STUN 匹配读到垃圾内存）。
+4. body/sdp 缓冲要有明确上限并拒绝超限（静默截断会导致 JSON 解析失败变成难排查的 400）。
 
 ---
 
-## 3. nginx stream UDP 模块开发关键
+## 4. UDP 服务与 nginx stream 集成（`ngx_rtc_stream_module`）
 
-### 3.1 核心 API
+### 4.1 核心机制：nginx 已解决「UDP 无连接 vs WebRTC 长会话」矛盾
 
-| 结构/函数 | 位置（nginx-1.25.3 源码） | 用途 |
-| --- | --- | --- |
-| `ngx_stream_module_t` | src/stream/ngx_stream.h:217-248 | stream 模块上下文（pre/postconfiguration、create/init/merge main+srv conf） |
-| `ngx_stream_session_t` | src/stream/ngx_stream.h:190-230 | 会话对象，`s->connection`、`s->ctx[module.ctx_index]` 存模块私有状态 |
-| `ngx_stream_core_srv_conf_t` / `listen` 解析 | src/stream/ngx_stream_core_module.c:600-700（`udp` 分支 631） | `listen 8000 udp;` → `ls->type=SOCK_DGRAM` |
-| `ngx_stream_init_connection` | src/stream/ngx_stream_handler.c:21-202 | 新对端首个数据报时建 session，`rev->handler = ngx_stream_session_handler` |
-| `ngx_stream_session_handler` | src/stream/ngx_stream_handler.c:284-293 | 每个数据报的读回调 → `ngx_stream_core_run_phases(s)` |
-| `ngx_stream_core_run_phases` | src/stream/ngx_stream_handler.c（调用点 292） | 依序执行 preread→content→log 各 phase 的 handler |
-| `ngx_event_recvmsg` / `ngx_lookup_udp_connection` | src/event/ngx_event_udp.c:25,153 | 收 UDP 包，按对端地址复用已有连接 |
-| `ngx_insert_udp_connection` | src/event/ngx_event_udp.c:331 | 新对端插入 UDP 连接红黑树 |
-| `ngx_udp_shared_recv` / `ngx_udp_send` | src/event/ngx_event_udp.c:368 / c->send 赋值 239 | UDP 收发（`c->buffer` 为当前数据报） |
-| `ngx_stream_get_module_ctx` / `ngx_stream_set_ctx` | src/stream/ngx_stream.h:271-272 | 存取会话私有状态 |
-| `ngx_stream_finalize_session` | src/stream/ngx_stream_handler.c:297-307 | 结束会话（UDP 下**别主动调**，否则销毁连接缓存） |
-
-### 3.2 生命周期（含关键结论）
+`ngx_event_udp.c` 用红黑树按 `(peer ip:port, local addr)` 缓存 UDP 连接，同对端后续数据报复用同一 `ngx_connection_t` 与 `ngx_stream_session_t`——DTLS/SRTP/SSRC 会话状态放 `s->ctx` 即可跨数据报持久，**无需自研 UDP 复用层**。
 
 ```mermaid
 sequenceDiagram
@@ -207,7 +226,7 @@ sequenceDiagram
     participant C as UDP连接缓存
     participant I as ngx_stream_init_connection
     participant S as ngx_stream_session_t
-    participant M as ngx_rtc_core(content phase)
+    participant M as ngx_rtc_stream(content phase)
 
     U->>C: ngx_lookup_udp_connection(ls, peer)
     alt 新对端
@@ -224,155 +243,155 @@ sequenceDiagram
     M-->>S: NGX_OK / 异步注册写事件
 ```
 
-**关键结论（务必理解）**：
+### 4.2 生命周期与收发规则
 
-1. **nginx 已解决「UDP 无连接 vs WebRTC 长会话」矛盾**：`ngx_event_udp.c` 用红黑树按 `(peer ip:port, local addr)` 缓存连接，同对端后续数据报复用同一 `ngx_connection_t` 与 `ngx_stream_session_t`，会话状态（DTLS/SRTP/SSRC）放 `s->ctx` 即可跨数据报持久。
-2. **content handler 每数据报被调一次**，自己负责读 `c->buffer`、分发、并在需要时调用 `ngx_handle_read_event(rev, 0)` 保持读事件活跃；UDP 场景不要在 content 阶段调 `ngx_stream_finalize_session`（那是 TCP 代理的收尾动作）。
-3. **模块类型要声明 `NGX_STREAM_MODULE`**，main_conf 存全局单例（DTLS 证书、libsrtp、会话红黑树），srv_conf 存 `listen udp` 对应的端口与开关；`postconfiguration` 里向 `cmcf->phases[NGX_STREAM_CONTENT_PHASE].handlers` push 自己的 content handler。
-4. **收发都走 nginx 事件模型**：收用 `c->buffer`/`ngx_udp_shared_recv`；发用 `c->send`（等价 SRS `SrsRtcUdpNetwork::write` → `sendto`，srs_app_rtc_network.cpp:429-436）。**禁止在 handler 里 `sendto`/`recvfrom` 直连 fd**，否则破坏 nginx 的连接缓存与统计。
-5. **`listen 8000 udp;` 的 server 块要指向本模块**：stream 的 server 会生成 `ls->handler = ngx_stream_init_connection`（src/stream/ngx_stream.c:486），但 content 阶段由模块注册，所以 server 块只需保证 `ngx_rtc_core` 的 content handler 被挂上。
+1. **content handler 每数据报被调一次**，负责读 `c->buffer`、判别 STUN/DTLS/RTP/RTCP 并分发；**不要在 content 阶段调 `ngx_stream_finalize_session`**（那是 TCP 代理的收尾，会销毁 UDP 连接缓存）。
+2. **收发都走 nginx 事件模型**：收用 `c->buffer`/`c->recv`，发用 `c->send`（等价 sendto）。**禁止在 handler 里直接 `sendto`/`recvfrom` 操作 fd**，否则破坏 nginx 的连接缓存与统计。高负载时应循环 drain（参照 `ngx_event_recvmsg` 的 `do{}while(ev->available)`），避免单事件多包滞留拖慢握手。
+3. **会话关闭必须释放底层 UDP 连接**：只释放自研结构不调 finalize，`ngx_connection_t` 槽位会永久泄漏，累计到 `worker_connections` 后新观众无法建会话。正确做法是经 post event 延迟调用 `ngx_stream_finalize_session`（接收路径内同步关闭有 use-after-free 风险，官方有过同类修复）。
+4. **周期任务一律 `ngx_event_timer`**（session 空闲回收、RTCP SR 周期发送），禁止自建线程/定时器。回收按 `last_active` 分级（握手中 10s、就绪 30s），就绪会话靠客户端 RTCP 保活。
+5. **模块类型 `NGX_STREAM_MODULE`**：main_conf 存全局单例（DTLS 证书、libsrtp、会话注册表），`postconfiguration` 向 `cmcf->phases[NGX_STREAM_CONTENT_PHASE].handlers` push content handler。
+
+关键行号索引（nginx stream/event）：
+
+| 符号 | 位置 |
+| --- | --- |
+| `ngx_stream_core_listen`（`udp` → SOCK_DGRAM） | `ngx_stream_core_module.c:574,631` |
+| `ngx_event_recvmsg`（UDP 收包/连接复用） | `ngx_event_udp.c:24-348` |
+| `ngx_stream_finalize_session` | `ngx_stream_handler.c:296-307` |
+| `ngx_stream_session_t` / `ngx_stream_module_t` | `ngx_stream.h:199-248` |
+| 指令 setter 范本 | `ngx_stream_return_module.c:189-216` |
 
 ---
 
-## 4. nginx HTTP 信令模块（ngx_rtc_api）
+## 5. QoS 闭环：RTCP 反馈、NACK 重传与首帧加速
 
-SRS 参考：`SrsGoApiRtcPlay`（srs_app_rtc_api.cpp:52-278）。请求协议为 `POST /rtc/v1/play/`，body `{"sdp":"<offer>","streamurl":"rtmp://.../app/stream"}`，返回 `{"sdp":"<answer>","sessionid":"<username>"}`。
+**与 SRS 的关键架构差异**：SRS 的推流端是浏览器（RTC 推流），PLI 关键帧请求可送回编码器；本方案推流端是 RTMP（TCP 可靠、无 RTC 上行），**PLI 无处可送，必须用「缓存最近 GOP + 订阅即发」替代**。因此只需要 SRS 发送侧 ARQ（NACK 重传）的一半，不需要接收侧丢包检测那一半。
 
-### 4.1 核心 API
-
-| 结构/函数 | 位置 | 用途 |
+| 机制 | SRS 实现参照 | 必要性 |
 | --- | --- | --- |
-| `ngx_http_module_t` | src/http/ngx_http_config.h:24-36 | http 模块上下文（多 create/merge loc_conf） |
-| `ngx_http_core_loc_conf_t->handler` | src/http/ngx_http_core_module.h:340 | 挂 content handler（location 级） |
-| `ngx_http_core_content_phase` | src/http/ngx_http_core_module.h:493 | content phase 入口 |
-| `ngx_http_read_client_request_body` | src/http/ngx_http_request.h（声明） | 异步读 body，完成后回调 `post_handler` |
-| `r->request_body->bufs` | ngx_http_request_t | 读完后取 body 字节 |
-| `ngx_http_output_filter` / `ngx_http_send_header` | — | 回写 JSON answer |
+| SRTCP 加解密 + RTCP 编解码（compound/NACK/PLI/RR/SR/BYE） | `srs_kernel_rtc_rtcp.cpp` | 必需（一切反馈的前提） |
+| NACK 下行重传（发送侧 ARQ + 源级 RTP 环形缓存） | `SrsRtcSendTrack::on_nack`（srs_app_rtc_source.cpp:2905-2950） | 必需（丢包 >3% 时无 NACK 画面迅速劣化） |
+| 首帧加速：GOP 缓存 + 订阅即发（替代 PLI） | IDR 前 STAP-A（已同款）；RTMP 场景须自建 GOP 缓存 | 必需（否则新观众等 2-5s 下一个 IDR） |
+| Session 生命周期 + 超时回收 | `SrsRtcConnection::is_alive` + `session_timeout` | 必需（资源正确性） |
+| Opus 封装（ts=dts×48、marker=1、一帧一包） | `package_opus`（srs_app_rtc_source.cpp:1033） | 必需（完整直播） |
+| 每订阅者重写 PT（`rebuild_packet` 思路） | `SrsRtcSendTrack::rebuild_packet`（srs_app_rtc_source.cpp:2785-2903） | 必需（异构浏览器 PT 不同，见 6.1） |
+| RR + NACK 间隔随 RTT 自适应 | `SrsRtpNackForReceiver::update_rtt` | 建议（弱网优化） |
+| TWCC / GCC / REMB | SRS 对本场景同样空实现/忽略 | **不做**（RTMP→RTC 单向播放，无上行媒体、服务器无编码器可调码率） |
+| 音视频 NTP/RTP 同步（avsync） | `SrsRtcRecvTrack` | 不需要（下行音视频 ts 均源自同一 RTMP timestamp，天然同步） |
 
-### 4.2 实现要点
+**GOP 环形缓存设计要点**：
 
-1. **postconfiguration 里**向 `ngx_http_core_main_conf_t->phases[NGX_HTTP_CONTENT_PHASE].handlers` push 本模块 handler（或在 location 用 `r->content_handler`），只处理匹配的 URI（`/rtc/v1/play/`）。
-2. **content handler 流程**：先 `r->method==POST` 校验 → `ngx_http_read_client_request_body(r, ngx_rtc_api_body_handler)`；在 body_handler 里取 `r->request_body->bufs` 拼成字符串——对应 SRS `do_serve_http` 的 `body_read_all`（srs_app_rtc_api.cpp:78）。
-3. **解析 JSON**（nginx 无内置 JSON，可用 OpenResty 的 lua-cjson 或自写最小解析器只取 `sdp`/`streamurl` 两字段），再 `ngx_rtc_sdp_parse(offer)`——SRS（srs_app_rtc_api.cpp:172-174）。
-4. **建会话**：调 `ngx_rtc_core_create_session(streamurl, offer, &local_sdp)`，内部做 `check_remote_sdp` → `negotiate_play_capability` → `generate_play_local_sdp` → 注册 username——SRS（srs_app_rtc_api.cpp:196-257）。**会话在 HTTP 请求结束后必须存活**，所以会话对象要挂在全局注册表（ngx_rtc_core main_conf），不能挂在 `r->pool`。
-5. **回包**：`{"code":0,"sdp":"<answer 转义 \\r\\n>","sessionid":"<username>"}`，`Connection: Close`，Content-Type application/json——SRS（srs_app_rtc_api.cpp:70-72,186-187,264-270）。
-
-> 方向字段约定：play 场景 answer 的 audio/video media 为 `a=sendonly`（服务端只发不收）——SRS `negotiate_play_capability` 末尾 `track->set_direction("sendonly")`（srs_app_rtc_conn.cpp:3231）。
-
----
-
-## 5. 完整数据流
-
-```mermaid
-flowchart LR
-    subgraph IN["1. RTMP 推流"]
-        A["RTMP push<br/>:1935"]
-    end
-    subgraph BRIDGE["2. ngx_rtc_bridge（RTMP 模块）"]
-        B["events[MSG_VIDEO]<br/>取 FLV tag"]
-        C["sequence header?<br/>缓存 SPS/PPS"]
-        D["NALU 提取<br/>剔 B 帧"]
-    end
-    subgraph RTP["3. ngx_rtc_rtp"]
-        E["single NALU<br/>(≤1200B)"]
-        F["FU-A 分片<br/>(>1200B)"]
-        G["IDR 前<br/>STAP-A SPS/PPS"]
-    end
-    subgraph SRC["4. ngx_rtc_source"]
-        H["广播给所有<br/>consumer 队列"]
-    end
-    subgraph SRTP["5. ngx_rtc_dtls/srtp"]
-        I["RTP encode →<br/>srtp_protect"]
-    end
-    subgraph OUT["6. ngx_rtc_core（stream）"]
-        J["c->send<br/>SRTP over UDP :8000"]
-    end
-    A --> B --> C --> D --> E --> H --> I --> J
-    D --> F --> H
-    D --> G --> H
-
-    style A fill:#e8f4fd,stroke:#2196f3
-    style B fill:#e8f5e9,stroke:#4caf50
-    style C fill:#e8f5e9,stroke:#4caf50
-    style D fill:#e8f5e9,stroke:#4caf50
-    style E fill:#fff3e0,stroke:#ff9800
-    style F fill:#fff3e0,stroke:#ff9800
-    style G fill:#fff3e0,stroke:#ff9800
-    style H fill:#f3e5f5,stroke:#9c27b0
-    style I fill:#ffe0b2,stroke:#ef6c00
-    style J fill:#c8e6c9,stroke:#388e3c
-```
-
-端到端时序（含信令与 DTLS/SRTP 建立）：
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant P as 推流端(RTMP)
-    participant B as ngx_rtc_bridge
-    participant S as ngx_rtc_source
-    participant API as ngx_rtc_api(HTTP)
-    participant C as ngx_rtc_core(UDP)
-    participant W as 浏览器
-
-    P->>B: publish + video/audio tag
-    B->>S: 建源, 缓存 SPS/PPS, 封 RTP 入队
-    W->>API: POST /rtc/v1/play/ {sdp:offer}
-    API->>C: create_session(offer) → answer + username 注册
-    API-->>W: {sdp:answer, sessionid}
-    W->>C: STUN Binding Request(username)
-    C-->>W: STUN Binding Response(mapped addr)
-    W->>C: DTLS ClientHello
-    C->>C: SSL_do_handshake → 导出 SRTP key(use_srtp)
-    C->>S: 注册 player(SSRC/PT 协商结果)
-    loop 每个 RTP 包
-        S->>C: RTP pkt(PT/SSRC/seq/ts)
-        C->>C: srtp_protect
-        C-->>W: SRTP/UDP 媒体
-    end
-```
-
-对应 SRS 函数链条：`SrsRtmpConn::start_publish`(srs_app_rtmp_conn.cpp:1122) → `SrsFrameToRtcBridge::on_frame`(srs_app_stream_bridge.cpp:145) → `SrsRtcRtpBuilder::on_video`(srs_app_rtc_source.cpp:1054) → `SrsRtcSource::on_rtp`(732) → `SrsRtcPlayStream::send_packet`(srs_app_rtc_conn.cpp:702) → `SrsRtcConnection::do_send_packet`(2504) → `SrsRtcUdpNetwork::write`(srs_app_rtc_network.cpp:429)。
+- source 内**定长槽数组**缓存明文 RTP（一次缓存、N 订阅者回放/NACK 用），DTLS 完成订阅时先回放最近一个 GOP（自最新 IDR 的 STAP-A 起），无需等下一个 IDR。
+- **音视频分环或按 ssrc+seq 双重匹配**：音视频 seq 各自独立计数，混存一个 ring 时以最老槽 seq 为基准的差值定位基本失效，且不核对 `media_ssrc` 时可能重传出错误流的数据。
+- **NACK 只服务视频且按 `media_ssrc` 过滤**；fetch 时校验 seq 完全一致再重传（避免 SRTP 失败），重发走 `allow_repeat_tx=1`。
+- **回放需要 pacing**：GOP 回放一次可突发上千包，多观众同时加入时在单事件循环内串行突发会打爆客户端 jitter buffer，需要限速或提前终止。
+- 借鉴 RT-Thread `rt_ringbuffer` 的「mirror bit 空满判定」与「满覆盖最旧」语义即可，**不引入 DPDK rte_ring 的 CAS 无锁结构**（单 worker 事件循环内是单生产者 + 多只读消费者，无并发竞争），也不必套用 `ngx_buf_t` 引用计数（多 worker 前是多余负担）。
 
 ---
 
-## 6. MVP video-only 最小实现路径
+## 6. 零拷贝边界与资源管理
 
-原则：先打通 H264→RTP→DTLS→SRTP→STUN 的视频通路，音频（AAC→Opus 转码）整体后置。分 5 步，每步有明确验证项。
+### 6.1 不可消除的拷贝与可消除的拷贝
 
-| 步骤 | 内容 | 验证项 |
+1. **SRTP 加密 N 次无法避免**：每 session 密钥独立（DTLS 导出），libsrtp2 in-place 加密且密文各不相同——「每 session 一次 memcpy + 一次 protect」是协议决定的下界。
+2. **N>1 时每 session 的 memcpy 同样无法消除**：明文 RTP 是共享模板，in-place 加密会破坏它。可优化的只有：密文缓冲常驻 session（消除栈上 1600B 抖动）、单订阅者快路径省一次拷贝。
+3. **PT 重写**：明文模板源级共享，每 session 加密前重写本 session 协商的 PT（1 字节写）。**源级 PT 单例化（首个观众固化 PT）是错误做法**——第二个观众 offer 的 PT 与第一个不同时协商失败，多观众场景必须每会话重写。
+4. **媒体面不要引入 `ngx_chain_t`/`ngx_output_chain`**：`ngx_buf_t` 的 file/shadow/mmap 语义对 UDP 单包发送无收益，`c->send` 一条 sendto 已够；批量优化用 `ngx_udp_send_chain`（内部拼 iovec/sendmmsg）。HTTP 信令响应用 `ngx_create_temp_buf`/`ngx_alloc_chain_link` 没问题。
+5. **NACK ring 的 RTP 包避免每包堆分配**：固定容量数组 slot（seq + 指针 + 长度）+ 预分配数据区，与 SRS `SrsRtpRingBuffer` 同构。
+
+### 6.2 资源生命周期
+
+1. **session/source 跨请求存活**：session 用 `ngx_alloc` + 显式回收（reap timer + close 释放）；source 要有 remove 路径（断流释放 ring/转码器/移出 rbtree），且断流重推要复位 seq/timestamp（否则 RTP 非单调，订阅者解码错乱）。
+2. **UDP 连接槽位**：session 关闭必须连带结束底层 nginx stream 会话（见 4.2-3）。
+3. **单 worker 下 source 用 `ngx_rbtree`（按 app/stream 名 O(log n) 查找）、session/订阅者用 `ngx_queue`**——按需取 nginx 既有数据结构，不自研。
+
+---
+
+## 7. 多 worker 扩展
+
+**问题**：多 worker 下信令落在 worker A、UDP 落在 worker B 时，进程内注册表查不到 session（每个 worker 独立的 DTLS 证书还会导致 SDP fingerprint 与握手证书不一致）。
+
+**方案约束**：
+
+1. 共享状态进 `ngx_shm_zone` + `ngx_slab_pool` + `ngx_shmtx`：source/session 的**索引**（name、ssrc、pt、状态、owner worker）进 slab；**私有句柄（SSL/BIO、srtp_t、转码器、ngx_connection_t*）不进 shm**，留在各 worker 私有扩展表，按 session ID 反查。
+2. 跨 worker 媒体：per-worker 媒体环 + eventfd 唤醒消费 worker，owner worker 做 SRTP 加密后发送；GOP 快照（关键帧 AU）下沉 shm，任意 worker 订阅可立即回放。
+3. **共享结构必须在 `init_module`（fork 前）创建**——`init_process` 只在 worker 调、master 不调；DTLS 自签证书同理要在 fork 前生成一份，worker 靠 fork 继承。周期 timer 则必须放 `init_process`（master 无事件循环）。
+4. worker 周期 timer（C 模块写共享状态）只能放 `init_process`；注意 `NGX_RTMP_MODULE` 类型模块的 `init_process` 不会被调用，挂在这类模块上的定时器要移到 http/stream 模块启动。
+5. 消费端竞态：ring 条目存 shm session 指针会悬垂（出队后 session 可能已释放），改存单调递增 session ID，consumer 按 ID 反查。
+6. **NGX_RTMP_MODULE 类型的 RTMP 分发跨 worker** 另有官方 `ngx_rtmp_auto_push_module`（unix socket 自动推给所有 worker），与自研 RTC 的 shm 路线并存、互不替代。
+7. RTMP/HTTP-FLV 跨 worker 播放需 `rtmp_auto_push on`（live 状态 per-worker），与 RTC 侧方案独立。
+8. UDP `reuseport` 下同一客户端的所有包必须落同一 worker（内核四元组哈希保证）。
+
+详细设计（slab 布局、三段式初始化、双 registry 镜像）见 `multi-worker-shm-design.md`。
+
+---
+
+## 8. 开源先例与可借鉴实现
+
+| 来源 | 可借鉴点 |
+| --- | --- |
+| **nginx 官方 stream DTLS patch**（Vladimir Homutov，2018 未合并） | `DTLSv1_listen()` + HelloVerifyRequest cookie（HMAC-SHA1 绑定客户端地址）无状态反欺骗；`DTLSv1_handle_timeout` 定时驱动重传；UDP SSL listener 的配置校验（ssl_protocols 交叉校验、DTLS listener 禁 TLS）；编译期探测 `DTLSv1_listen` 门控版本。印证「nginx 内做 DTLS/WebRTC」方向官方曾考虑 |
+| **nginx-srt-module**（getpagespeed，商业） | 唯一「nginx 内集成带自有事件循环协议栈」的工业先例：libsrt 跑独立线程 + eventfd 通知 nginx 事件循环——音频转码/阻塞型 CPU 密集工作的参考答案 |
+| **Cloudflare quiche 的 nginx patch** | 协议库自带 timer 回调接进 `ngx_add_timer` 的集成范式（「下一个超时时间」回调接口，事件循环内精确调度握手重传） |
+| **SRS 6.0** | 协议栈事实参考系（本文档全篇的 file:line 参照） |
+| **OpenResty 生态**（lua-resty 系） | 见 8.1 |
+
+**否定性结论**（调研确认，避免重复调研）：
+
+- 不存在可复用的成熟 nginx 进程内 RTMP→WebRTC 模块；不存在可承载 WebRTC 媒体面的 `lua-resty-webrtc/rtmp/sdp/dtls/stun/turn` 模块。
+- nginx-rtmp-module / nginx-http-flv-module 只覆盖 RTMP/HTTP-FLV，适合继续承担推流接入与 HTTP-FLV 兜底，WebRTC 能力留在自研模块。
+
+### 8.1 OpenResty 生态组件取舍
+
+| 组件 | 决策 | 说明 |
 | --- | --- | --- |
-| **Step 1 骨架** | 搭 `ngx-rtc-module` addon（config 脚本），写 `ngx_rtc_core`（stream 模块）：`listen 8000 udp;` 生效、content handler 收包打日志、`c->send` 回一个字节 | 用 `nc -u` 或自制 UDP 客户端发/收；`error.log` 出现包长与对端地址 |
-| **Step 2 RTP 封装** | 写 `ngx_rtc_rtp`：FLV tag → NALU 切分 → single/FU-A/STAP-A，纯 C 单测（不接网络）；`ngx_rtc_bridge` 挂 RTMP 事件钩子 | 单测验证 FU-A 的 indicator/header、marker 位、`ts=ms*90`；推一路 H264 RTMP，日志打印每帧封出的包数/字节 |
-| **Step 3 SDP 信令** | 写 `ngx_rtc_sdp` + `ngx_rtc_api`：解析 Chrome offer、生成 answer（固定 PT=102、sendonly、BUNDLE、ice-ufrag/pwd、fingerprint、candidate） | 用 Chrome 打开 test page，HTTP 返回合法 answer；浏览器 `setRemoteDescription` 不报错 |
-| **Step 4 STUN + DTLS** | 写 `ngx_rtc_stun` + `ngx_rtc_dtls`：Binding Response、DTLS 握手、`SSL_export_keying_material` 导出 key（先打印 key 前 16 字节对比 RFC 5764 测试向量） | 浏览器日志进入 `oniceconnectionstatechange=connected`；服务端日志出现 DTLS handshake done + SRTP key 导出成功 |
-| **Step 5 SRTP 收尾** | 写 `ngx_rtc_srtp`（libsrtp2）：把 Step 2 的 RTP 包在 DTLS 完成后 protect 后经 `c->send` 发出；play 会话与源消费者打通 | Chrome 画面出视频；`chrome://webrtc-internals` 显示 `bytesReceived` 持续增长、无 `decryption failure` |
-
-每步的 SRS 参照：
-
-- Step 2 → `SrsRtcRtpBuilder::on_video/package_fu_a`（srs_app_rtc_source.cpp:1054,1347）
-- Step 3 → `SrsGoApiRtcPlay::serve_http` + `generate_play_local_sdp`（srs_app_rtc_api.cpp:192, srs_app_rtc_conn.cpp:3289）
-- Step 4 → `SrsDtlsImpl::do_on_dtls/get_srtp_key`（srs_app_rtc_dtls.cpp:570,647）
-- Step 5 → `SrsSRTP::protect_rtp` + `do_send_packet`（srs_app_rtc_dtls.cpp:1008, srs_app_rtc_conn.cpp:2504）
+| `lua_shared_dict` | **可用（首选）** | 共享状态载体：stream_keys / rate_limit / 统计镜像 |
+| `resty.limit.count`（lua-resty-limit-traffic） | **用** | 信令限流，OpenResty 内置，显式 count/window 语义规范 |
+| cosocket | **可用** | 外接认证网关、`on_publish` 回调查外部服务 |
+| lua-resty-lock | **可用** | 多 worker 协调、共享状态原子更新时引入 |
+| lua-resty-redis / mysql | **排除** | 不引入外部存储依赖，stream key 本地表 + shared dict 热加载（10s `ngx.timer.every`） |
+| session 超时/回收 | **保持 C 模块** | 归 stream 模块 reap timer，Lua 只做信令/限流/配置，不重复造 session 状态 |
 
 ---
 
-## 7. 关键风险与规避
+## 9. 关键风险与规避
 
-| 风险 | 影响 | 规避方案（依据 SRS 实践） |
+| 风险 | 影响 | 规避方案 |
 | --- | --- | --- |
-| **DTLS-SRTP 密钥导出错误**（RFC 5764 use_srtp） | 握手成功但 SRTP 全错，浏览器报 `DTLS failure`/解密失败 | 严格按 `SSL_export_keying_material("EXTRACTOR-dtls_srtp")` 取 60 字节（client key16+salt14, server key16+salt14），**按自身角色分配 recv/send**——SRS `get_srtp_key`（srs_app_rtc_dtls.cpp:647-676）。必须在 `SSL_CTX_set_tlsext_use_srtp(ctx,"SRTP_AES128_CM_SHA1_80")` 声明后才能导出 |
-| **SRTP 自研 vs libsrtp2** | 自研 AES-CTR/HMAC-SHA1 易错（序号回绕、认证 tag 80bit、ROC） | **用 libsrtp2**（SRS 同款 `srtp_protect/unprotect`，srs_app_rtc_dtls.cpp:1008-1074）；仅当移植环境受限再自研，且必须过 RFC 3711 测试向量 |
-| **B 帧过滤时机** | 带 B 帧的流封成 RTP 后 WebRTC 解码花屏/卡顿；过滤过晚浪费 CPU | 在 NALU 切分后、RTP 封装前过滤（解析 slice_type 判断 B 帧），与 SEI 丢弃同处——SRS `filter`（srs_app_rtc_source.cpp:1131-1172）。MVP 可先 `keep_bframe=true` 全透传，遇花屏再开启过滤 |
-| **SSRC / PT 分配冲突** | 多路流或多消费者 SSRC 重复 → 浏览器丢流；PT 与 offer 不符 → 解不出码 | PT 用 offer 协商值覆盖源 PT（不能固定写死 102）；SSRC 由服务端生成器统一分配（每路下行独立）——SRS `negotiate_play_capability`（srs_app_rtc_conn.cpp:3191,3220）。STAP-A/FU-A 的 RTP 头 PT 一律用协商后的视频 PT |
-| **nginx stream UDP 会话被误销毁** | content 阶段默认 finalize 会关连接，DTLS 状态丢失 | content handler 处理完数据报**只返回 NGX_OK，不调 `ngx_stream_finalize_session`**；会话存活靠 UDP 连接缓存（src/event/ngx_event_udp.c:153,331） |
-| **HTTP 会话对象随 request pool 释放** | 信令返回后 session 被回收，后续 STUN/DTLS 找不到会话 | 会话对象分配在 `ngx_cycle` 级或 `ngx_rtc_core` main_conf 的池，用引用计数/超时回收；HTTP request 只保留指向它的索引 |
-| **RTMP 事件钩子拿到的是 FLV tag 而非裸 NALU** | 直接当 NALU 用会解析失败 | 先解 FLV video tag 头（1B type/codec + 1B AVCPacketType + 3B CTS），再按 AVCC 长度前缀切 NALU；SPS/PPS 从 `AVCPacketType==0` 的 AVCDecoderConfigurationRecord 里取——对应 SRS `SrsFormat::on_video` 解析、`SrsFlvVideo::sh` 判断（srs_app_rtc_source.cpp:1059） |
+| DTLS-SRTP 密钥导出错误 | 握手成功但 SRTP 全错，浏览器报解密失败 | 严格按 `SSL_export_keying_material("EXTRACTOR-dtls_srtp")` 取 60 字节按角色切分；必须先 `SSL_CTX_set_tlsext_use_srtp` |
+| DTLS server 未设 accept 状态 | `ssl_read_internal:uninitialized`，握手无感知失败 | 显式 `SSL_set_accept_state(ssl)`（OpenSSL 不因 `DTLS_server_method()` 自动进入） |
+| STUN BindingResponse 越界写栈 | 持合法 ufrag 的客户端可触发 worker 栈破坏（单 worker 即全站 DoS） | 编码器内做 `out_len` 边界检查；ufrag 上下限与实际分配一致；请求校验 MESSAGE-INTEGRITY |
+| B 帧过滤时机 | 带 B 帧流封 RTP 后 WebRTC 花屏/卡顿 | NALU 切分后、RTP 封装前解析 slice_type 过滤 |
+| SSRC/PT 处理不当 | 多观众 PT 冲突协商失败；STUN 匹配不到 session | PT 用 offer 协商值、每 session 发送前重写；SSRC 服务端统一分配；STUN username 按 `server:client` 实际顺序取 ufrag |
+| nginx stream UDP 会话被误销毁 | content 阶段 finalize 会关连接，DTLS 状态丢失 | 数据报处理完只返回 NGX_OK；会话存活靠 UDP 连接缓存 |
+| session 随 request pool 释放 | 信令返回后 session 被回收，STUN/DTLS 找不到会话 | `ngx_alloc` 挂全局注册表 + reap timer 回收 |
+| 事件钩子拿到 FLV tag 当裸 NALU | 解析失败 | 先解 FLV video tag 头（1B type/codec + 1B AVCPacketType + 3B CTS），再按 AVCC 长度前缀切 NALU；SPS/PPS 从 AVCDecoderConfigurationRecord 取 |
+| SDP answer 缺 candidate / rtcp-fb | 信令成功但零媒体 / NACK-PLI 链路休眠 | answer 带 media 级 `a=candidate`；实现 NACK/PLI 就声明对应 `rtcp-fb` |
+| 命令行 reload 不换二进制 | 改 C 代码后 `nginx -s reload` 仍跑旧 inode，新日志/修复不生效 | 模块变更需 stop + 全量重启（或 USR2 热升级）；排查"日志不打印"先查 `/proc/<master>/exe` |
+| 事件循环内同步 CPU 密集工作 | 单 worker 下多路推流互相挤压，握手/分发延迟 | 音频转码独立 pthread + 有界环（nginx-srt 模式）；周期任务走 `ngx_event_timer` |
 
 ---
 
-## 关键结论 3 条
+## 10. 落地路线（video-only 起步，逐层叠加）
 
-1. **架构上 SRS 的每个 RTC 组件都能 1:1 映射到 nginx C 模块**：桥接用 RTMP 模块 `events[MSG_VIDEO/AUDIO]` 钩子，UDP 服务用 stream 模块 `listen udp`（nginx 1.25.3 已内置按 peer 复用的 UDP 连接缓存），信令用 HTTP content handler，密码学（DTLS/SRTP/STUN）与 RTP 封装作为普通 C 源文件链接。
-2. **实现难度集中在 DTLS-SRTP 密钥导出与 H264→RTP 封装两处**，前者严格照 `SSL_export_keying_material("EXTRACTOR-dtls_srtp")` 60 字节 key/salt 切分（SRS `get_srtp_key`），后者照 `SrsRtcRtpBuilder::package_single_nalu/package_fu_a/package_stap_a` 的 PT=协商值、`ts=ms×90`、1200 字节分片阈值、末片 marker=1 规则。
-3. **MVP 采用 video-only 五步走**（骨架→RTP 封装→SDP 信令→STUN+DTLS→SRTP 收尾），每步一个可观测验证项；AAC→Opus 转码与 B 帧过滤均为可后置的增量，先打通视频再叠加，风险最低。
+| 阶段 | 内容 | 验证项 |
+| --- | --- | --- |
+| **Step 1 骨架** | addon `config` + stream 模块：`listen 8000 udp` 生效、content handler 收包打日志、`c->send` 回包 | UDP 客户端收发；error.log 出现包长与对端地址 |
+| **Step 2 RTP 封装** | FLV tag → NALU 切分 → single/FU-A/STAP-A，纯 C 单测（不接网络）；bridge 挂 RTMP 事件钩子 | 单测验证 FU-A indicator/header、marker 位、`ts=ms*90`；推流后日志打印每帧包数 |
+| **Step 3 SDP 信令** | offer 解析、answer 生成（协商 PT、sendonly、BUNDLE、ice-ufrag/pwd、fingerprint、candidate） | 浏览器 `setRemoteDescription` 不报错 |
+| **Step 4 STUN + DTLS** | Binding Response、DTLS 握手、密钥导出 | 浏览器 `oniceconnectionstatechange=connected`；服务端 DTLS handshake done |
+| **Step 5 SRTP 收尾** | libsrtp2 加密发送；play 会话与 source 订阅打通 | Chrome 画面出视频；webrtc-internals `bytesReceived` 增长、无 decryption failure |
+| **叠加一：音频** | AAC→Opus 转码 + Opus RTP（ts 单调 +960） | 音频连续无规律卡顿 |
+| **叠加二：QoS** | SRTCP + RTCP 编解码、NACK 重传、GOP 缓存订阅即发、answer 声明 rtcp-fb | 弱网（tc 丢包注入）下画面可恢复；新订阅者首帧不等 IDR |
+| **叠加三：生产化** | session/UDP 连接/source 回收闭环、多观众 PT 重写、转码线程隔离、单测补齐 | 长时间运行无连接槽泄漏；异构浏览器多观众同时播放 |
+| **叠加四：多 worker** | shm 注册表 + 媒体环 + eventfd（见第 7 节） | 信令与 UDP 分属不同 worker 时建链正常 |
+
+**验收口径**：端到端以 werift 无头播放器收包为准（audio.pkts>0 && video.pkts>0 即 PASS），另观测首个 H264 IDR 到达时间（`first_keyframe_ms`，真实出图延迟口径）。
+
+---
+
+## 11. 三条核心结论
+
+1. **架构上 SRS 的每个 RTC 组件都能 1:1 映射到 nginx C 模块**：桥接用 RTMP 模块 `events[MSG_VIDEO/AUDIO]` 钩子，UDP 服务用 stream 模块 `listen udp`（nginx 已内置按 peer 复用的 UDP 连接缓存），信令用 HTTP content handler，密码学与 RTP 封装作为无 nginx 依赖的纯 C 源文件链接——全链路可单测。
+2. **实现难度集中在 DTLS-SRTP 密钥导出与 H264→RTP 封装两处**：前者严格照 RFC 5764 的 60 字节 key/salt 切分，后者照 single/FU-A/STAP-A 的 PT=协商值、`ts=ms×90`、1200 字节阈值、末片 marker=1 规则；两者都必须有位级单测。
+3. **先 video-only 打通五步，再按「音频 → QoS → 生产化 → 多 worker」逐层叠加**：每层有独立验证项；不要提前引入多 worker 共享内存等过度设计，也不要在单 worker 阶段背负 shm 约束。

@@ -2,16 +2,15 @@
 
 ## 一、结论
 
-专利《一种基于 Nginx-rtmp 的 WebRTC 低延迟直播方法》的核心创新点是：**在 Nginx 框架内自研 RTC 模块**，而非依赖 SRS 等外部 RTC 服务。本方案已按此落地：在 OpenResty 1.31.1.1（bundle nginx-1.31.1）上，参考 SRS 6.0 的实现思路，用纯 C11 自研了一套 RTC 模块，静态编译进 nginx 进程，实现 RTMP 推流 → H264 NALU → RTP/FU-A 封装 → DTLS/SRTP/STUN → UDP 推送给浏览器 WebRTC 播放器。
+方案的核心是：**在 Nginx 框架内自研 RTC 模块**，而非依赖 SRS 等外部 RTC 服务。在 OpenResty 1.31.1.1（bundle nginx-1.31.1）上，参考 SRS 6.0 的实现思路，用纯 C11 自研 RTC 模块，静态编译进 nginx 进程，实现 RTMP 推流 → H264 NALU → RTP/FU-A 封装 → DTLS/SRTP/STUN → UDP 推送给浏览器 WebRTC 播放器。
 
-**端到端实测（MVP）**：视频 H264 收到 765 包 / 363KB，首包延迟 ~522ms；HTTP-FLV 兜底播放保留（HTTP 200）。MVP 为 video-only（AAC→Opus 音频转码后置）。
+**端到端实测**：视频 H264 收到 765 包 / 363KB，首包延迟 ~522ms；音频 AAC→Opus 线程隔离转码后正常出流；HTTP-FLV 兜底播放保留（HTTP 200）。
 
-**当前进展（相对 MVP 的增量）**：
+**能力构成**：
 
-- AAC→Opus 音频转码已落地，并做**线程隔离**（`ngx_rtc_audio_worker.c` 每路 pthread 独占 FFmpeg，配合有界环 `ngx_rtc_ring.c`）。
-- 多 worker 共享内存**阶段 0/1 已完成**：`rtc_zone` + `ngx_rtc_core_module` + slab zone 三段式初始化，采用**双 registry 镜像**（进程内 source/session 保留 + shm 骨架），详见 `docs/multi-worker-shm-design.md`。
-- 新增 `/rtc/v1/stats` 统计端点（`rtc_stats` 指令）、UDP 发送背压计数、GOP 回放背压提前终止、
-  `auth.lua` 改用 `resty.limit.req`（官方 lua-resty-limit-traffic）替换手写限流。
+- AAC→Opus 音频转码，**线程隔离**（`ngx_rtc_audio_worker.c` 每路 pthread 独占 FFmpeg，配合有界环 `ngx_rtc_ring.c`）。
+- 多 worker 共享内存：`rtc_zone` + `ngx_rtc_core_module` + slab zone 三段式初始化，**双 registry 镜像**（进程内 source/session 保留 + shm 骨架），详见 `docs/multi-worker-shm-design.md`。
+- `/rtc/v1/stats` 统计端点（`rtc_stats` 指令）、UDP 发送背压计数、GOP 回放背压提前终止；`auth.lua` 采用 `resty.limit.req`（官方 lua-resty-limit-traffic）限流。
 
 ## 二、总体架构
 
@@ -65,7 +64,7 @@ flowchart LR
 - **信令面（控制）**：浏览器 → POST /rtc/v1/play/ → HTTP 信令模块解析 offer → 创建/镜像 source+session →
   返回 answer SDP → 浏览器 STUN/DTLS 建链；GET /rtc/v1/stats 读取 source 注册表输出 JSON。
 - **元数据同步面（多 worker）**：http/stream/bridge 三处 glue 与 `rtc_zone` 的 shm 骨架双向同步
-  SSRC/PT/ufrag/pwd/srtp_ready/owner_slot/publishing（阶段 1 已落地，媒体热路径不跨 shm）。
+  SSRC/PT/ufrag/pwd/srtp_ready/owner_slot/publishing（媒体热路径不跨 shm）。
 
 ## 三、模块划分
 
@@ -119,7 +118,7 @@ ice-ufrag/pwd/fingerprint 与 H264/Opus PT，创建 source（SSRC/PT 权威在 s
 并写 shm 骨架），answer 含 `a=ice-lite`、`a=candidate`（media 级）、`a=fingerprint`、`a=sendonly`、`a=rtcp-mux`。
 `rtc_stats` 指令注册 GET `/rtc/v1/stats`，C 直接遍历 source 注册表输出 JSON（等价 SRS `/api/v1/streams`）。
 
-### 4.5 多 worker 共享内存（阶段 0/1 已完成）
+### 4.5 多 worker 共享内存
 
 `rtc_zone` 指令 + `ngx_rtc_core_module`（NGX_CORE_MODULE）在 `ngx_rtc_shm.c` 实现 slab zone 三段式初始化
 （`ngx_rtc_core_init_zone`，照 limit_req 模板）。落地方案为**双 registry 镜像**：进程内
@@ -127,7 +126,7 @@ ice-ufrag/pwd/fingerprint 与 H264/Opus PT，创建 source（SSRC/PT 权威在 s
 `ngx_rtc_shm_source_t`/`ngx_rtc_shm_session_t`（name/SSRC/PT/seq/ts/SPS/PPS/ASC/ufrag/pwd/srtp_ready/owner_slot/
 subscribers），按 name/ufrag 关联。glue 同步点：http 的 SSRC/PT 权威与 session 骨架 add、stream 的
 attach_from_shm/DTLS done/owner_slot 删除、bridge 的 sync_shm/close_stream。详细设计与偏差说明见
-`docs/multi-worker-shm-design.md`。阶段 2（shm 媒体环 + eventfd 唤醒）未开始。
+`docs/multi-worker-shm-design.md`；跨 worker 媒体分发（shm 媒体环 + eventfd 唤醒）见该文档第 5、6 节。
 
 ### 4.6 背压与线程隔离
 
@@ -150,19 +149,19 @@ attach_from_shm/DTLS done/owner_slot 删除、bridge 的 sync_shm/close_stream�
 | B 帧过滤 | `-bf 0` 推流验证，过滤逻辑就绪 |
 | HTTP-FLV 兜底 | HTTP 200，FLV 头正确（保留） |
 | 音频转码 | AAC→Opus 线程隔离转码，Opus RTP 正常出流 |
-| 多 worker shm 阶段 1 | HTTP 与 UDP 分属不同 worker 时 STUN 可找到 session、DTLS 可完成 |
+| 多 worker shm | HTTP 与 UDP 分属不同 worker 时 STUN 可找到 session、DTLS 可完成 |
 | stats 端点 | `/rtc/v1/stats` 输出 JSON（code=0 + streams） |
 
 验证工具：`client/play.mjs`（werift headless 客户端，useH264/useOPUS 协商）。
 
-## 六、待完善（后续阶段）
+## 六、扩展方向
 
-1. **多 worker 媒体环（阶段 2）**：shm 每 worker MPSC 环 + master 预建 eventfd 跨 worker 唤醒，
+1. **跨 worker 媒体分发**：shm 每 worker MPSC 环 + master 预建 eventfd 跨 worker 唤醒，
    `worker_processes auto` + UDP `reuseport`，详见 `docs/multi-worker-shm-design.md` 第 5、6 节。
-2. **多 worker 优化（阶段 3）**：per-source 锁、无锁 ring 入队、expire+LRU GC、同 worker 直发快路径。
-3. **鉴权**：`auth.lua` 已换 `resty.limit.req` 官方限流；stream key 校验等业务鉴权继续收敛在
+2. **多 worker 优化**：per-source 锁、无锁 ring 入队、expire+LRU GC、同 worker 直发快路径。
+3. **鉴权**：`auth.lua` 采用 `resty.limit.req` 官方限流；stream key 校验等业务鉴权收敛在
    `access_by_lua_file`。
-4. **candidate IP**：已由 `rtc_candidate_ip`/`rtc_candidate_port` 指令配置化（默认 127.0.0.1:8000），
+4. **candidate IP**：由 `rtc_candidate_ip`/`rtc_candidate_port` 指令配置化（默认 127.0.0.1:8000），
    对外部署设配置即可。
 
 ## 七、关键踩坑（详见 Memory）

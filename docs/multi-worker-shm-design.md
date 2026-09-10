@@ -1,39 +1,36 @@
 # ngx-rtc-module 多 worker 共享内存方案设计
 
-> 结论先行。本文给出现状痛点、三种方案对比、共享数据结构设计、媒体数据分布、跨 worker 唤醒机制与分阶段落地步骤。
+> 结论先行。本文给出多 worker 痛点、三种方案对比、共享数据结构设计、媒体数据分布、跨 worker 唤醒机制与实现分解。
 > 所有 nginx 源码行号基于 `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/`，
 > 模块代码基于 `/home/dgliu/workspace/webrtc/ngx-rtc-module/`。
 >
-> **实现状态（2026-09-09，已修订）**：阶段 0 与阶段 1 已完成并落地，采用「双 registry 镜像」方案（见 0.4），
-> 与本文第 4 节原始「单一 registry + 私有扩展」方案存在偏差。阶段 2（shm 媒体环 + 跨 worker eventfd 唤醒）
-> **已完全实现并端到端验证**。阶段 3 **部分完成**：每 ring 独立锁（`ring->mtx`）、source 空/断连回收、
-> 环满丢帧埋点（`ring_drops`）、GOP 关键帧快照下沉 shm 已落地；每 source 锁、ring 无锁 CAS、
-> expire+LRU 强淘汰、同 worker 直发快路径仍未实现。阶段 4（跨机 relay）未开始（可选）。
+> **实现说明**：采用「双 registry 镜像」方案（见 0.4），与本文第 4 节原始「单一 registry + 私有扩展」
+> 方案存在偏差；shm 媒体环 + 跨 worker eventfd 唤醒已实现并端到端验证。锁粒度/GC 方面：每 ring 独立锁
+> （`ring->mtx`）、source 空/断连回收、环满丢帧埋点（`ring_drops`）、GOP 关键帧快照下沉 shm 均实现；
+> 每 source 锁、ring 无锁 CAS、expire+LRU 强淘汰、同 worker 直发快路径为扩展项。跨机 relay 为可选扩展。
 
 ## 0. 结论
 
 1. **状态共享（推荐且唯一合理路径）**：采用 nginx 原生 `ngx_shm_zone` + `ngx_slab_pool` + `ngx_shmtx`，
    把 source 元数据、session 骨架（身份 + PT + 就绪标志 + 订阅关系）、SSRC/PT、seq/ts 计数器、SPS/PPS/ASC
    放进共享内存。这与 `ngx_http_limit_req_module`、`ngx_stream_limit_conn_module` 的官方做法完全一致，
-   天然获得 slab 分配器、自旋锁、reload/二进制升级的 `shm.exists` 续用语义。**阶段 0/1 已完成。**
+   天然获得 slab 分配器、自旋锁、reload/二进制升级的 `shm.exists` 续用语义。
 2. **私有状态绝不进 shm（实际采用双 registry 镜像）**：session 里的 `SSL*/BIO*`（DTLS）、`srtp_t`、
    `ngx_connection_t*`、`peer sockaddr`、AAC→Opus 转码器都是进程内指针/句柄。实际落地没有做
    「shm 骨架 + 每 worker 私有扩展表」的单一 registry 拆分，而是**完整保留**进程内
    `ngx_rtc_source_t` / `ngx_rtc_session_t`（含全部私有状态，媒体热路径继续用它），另建 shm 骨架
    `ngx_rtc_shm_source_t` / `ngx_rtc_shm_session_t` 只存跨 worker 必需元数据，两者按 name/ufrag 关联。
    理由与取舍见 0.4。
-3. **媒体数据本体放 shm 环形队列，不逐个 session 拷贝**（阶段 2，已完成）：RTMP worker 完成一次
+3. **媒体数据本体放 shm 环形队列，不逐个 session 拷贝**：RTMP worker 完成一次
    H264→RTP 封装后，把明文 RTP 包 + 目标 session 列表写入**每个目标 worker 一个 MPSC 环形队列**，
    由目标 worker 消费并做 per-session SRTP 加密发送。零拷贝到 socket 不可能——SRTP 每 session 密钥不同、
    必须就地变换，因此「每 worker 一份明文拷贝」是理论下界。
-4. **跨 worker 唤醒不能用 `ngx_notify`**（阶段 2，已完成）：`ngx_notify` 是**进程内** eventfd
+4. **跨 worker 唤醒不能用 `ngx_notify`**：`ngx_notify` 是**进程内** eventfd
    （`ngx_epoll_module.c:386-430`），只能唤醒本 worker。跨 worker 唤醒用 **master 在 fork 前创建的
    per-worker eventfd 数组**（所有 worker 继承全部 fd，可互写），fd 号存入 shm；写环后写 8 字节唤醒目标 worker。
-5. **落地分 4 阶段、最小改动**：阶段 0（`rtc_zone` + slab zone 初始化）与阶段 1（元数据上 shm，信令/绑定跨
-   worker 正确）**已完成**；阶段 2（媒体环 + eventfd）**已完成并验证**；阶段 3（锁粒度/GC/快路径）**部分完成**；
-   阶段 4（跨机 relay）未开始（可选）。全程只改模块，不改 nginx/http-flv 源码。
+5. **全程只改模块，不改 nginx/http-flv 源码**，最小改动。
 6. **封装模板**：source/session 注册表照搬 `ngx_http_limit_req_init_zone` 三段式 zone 初始化 + 全局
-   `shpool->mutex`；expire + LRU 淘汰**未在阶段 1 落地**（当前为显式 remove），属阶段 3（见 3.7）。
+   `shpool->mutex`；expire + LRU 淘汰未实现（当前为显式 remove，见 3.7）。
 
 ### 0.4 关键偏差：双 registry 镜像（实际落地方案）
 
@@ -60,7 +57,7 @@
 
 ## 1. 现状与痛点
 
-### 1.1 单 worker 基线（阶段 0 之前）
+### 1.1 单 worker 基线
 
 `ngx_rtc_core.c` 用**进程内**注册表保存全部状态（`/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_core.c`）：
 
@@ -71,7 +68,7 @@
 session 由 `ngx_rtc_http_module.c` 用 `ngx_alloc` 分配，跨 HTTP 请求存活。部署配置
 `openresty-rtmp-new/nginx/conf/nginx.conf` 曾显式 `worker_processes 1;`，注释写明「RTC source/session 注册表是每进程的」。
 
-> 阶段 1 落地后，`ngx_rtc_core.c/h` 的进程内注册表**仍然保留**，作为媒体平面（封装/GOP/SRTP/RTCP）的
+> 多 worker 方案下 `ngx_rtc_core.c/h` 的进程内注册表**仍然保留**，作为媒体平面（封装/GOP/SRTP/RTCP）的
 > 主用注册表；shm 只镜像跨 worker 元数据，见 1.4 与 0.4。
 
 三类流量落在哪个 worker 由 nginx 事件分发决定，彼此无关联：
@@ -110,11 +107,11 @@ session 由 `ngx_rtc_http_module.c` 用 `ngx_alloc` 分配，跨 HTTP 请求存�
 | `peer_addr` | `struct sockaddr*` | 指向 `c->sockaddr`，进程内地址 |
 | 音频转码器 | `ngx_rtc_audio_worker_t`（FFmpeg/libopus 堆句柄 + pthread） | 同理，仅属 RTMP worker |
 
-结论（已随阶段 1 落地修订）：**私有句柄绝不能进 shm**，但实际方案不是「单一 shm 骨架 + priv 扩展表」，
+结论：**私有句柄绝不能进 shm**，但实际方案不是「单一 shm 骨架 + priv 扩展表」，
 而是**双 registry 镜像**——进程内 `ngx_rtc_source_t`/`ngx_rtc_session_t` 完整保留（含 dtls/srtp/fsm/gop/conn/
 scratch/转码器），shm 骨架只存跨 worker 必需的身份/PT/就绪/订阅元数据，见 1.4。
 
-### 1.4 当前实际实现（阶段 0/1 落地后）
+### 1.4 实现结构（双 registry）
 
 新增 `ngx_rtc_shm.h/c`：`rtc_zone` 指令 + `ngx_rtc_core_module`（NGX_CORE_MODULE）+ slab zone 三段式初始化
 （`ngx_rtc_core_init_zone`，照 limit_req 模板）。shm 内两类骨架：
@@ -238,9 +235,9 @@ shdict 的所有操作（get/set/expire/lpush/lpop）都收敛到一把 `ngx_shm
 
 本模块的分层结论（与 shdict 一致但更明确）：
 
-- **注册表元数据（source/session 的查/建/改/删）用同一把全局 `shpool->mutex`**，第 1 阶段即如此。
+- **注册表元数据（source/session 的查/建/改/删）用同一把全局 `shpool->mutex`**。
 - **媒体热路径（每帧 subscriber 快照 + seq/ts 推进）不学 shdict 用全局锁**——shdict 没有每帧热路径。
-  第 2 阶段把热路径抽离到 per-source 锁 / 无锁环（见 4.5、5.3），避免每帧全局自旋竞争。
+  媒体环已用 per-ring 独立锁（见 4.5、5.3）避免每帧全局自旋竞争。
 
 ### 3.4 条目生命周期：expire + LRU，先于引用计数
 
@@ -277,7 +274,7 @@ shdict 用「定长头部 + `u_char data[1]` 尾随 key+value」一次 `ngx_slab
   `ngx_handle_read_event(c->read, 0)` 重挂读事件（`ngx_http_lua_socket_tcp.c:3062,3124`）。本模块
   eventfd 唤醒 handler 与环消费同构：读环到空、读 eventfd 清计数，不阻塞事件循环。
 
-### 3.7 source/session 注册表封装（阶段 0/1 已落地）
+### 3.7 source/session 注册表封装
 
 实际 API 见 `ngx_rtc_shm.h`，已按 shdict/limit_req 模板实现：
 
@@ -299,8 +296,8 @@ void ngx_rtc_shm_source_subscribe / unsubscribe(ctx, src, sess);
   「session 红黑树统一」有偏差）。
 - 锁：所有 get/find/add/remove/subscribe/unsubscribe 都是 `ngx_shmtx_lock(&pool->mutex)` +
   `ngx_slab_alloc_locked`，一把全局锁，临界区短促，与 shdict 一致。
-- 生命周期：**expire + LRU 未在阶段 1 落地**。当前为显式 remove（发布者关闭 / owner worker 断连时删），
-  source 删除前置校验 `subscribers` 为空；expire + LRU、强淘汰重试属阶段 3（见 3.4，原规划保留）。
+- 生命周期：**expire + LRU 未实现**。当前为显式 remove（发布者关闭 / owner worker 断连时删），
+  source 删除前置校验 `subscribers` 为空；expire + LRU、强淘汰重试为扩展项（见 3.4）。
 - 根表存 `pool->data`，reload 安全（三段式 init 已实现）。
 - 反向同步：shm 骨架是「镜像」而非唯一权威，http/stream/bridge 各 glue 点负责进程内 ↔ shm 的读写同步
   （见 1.4 同步点）。
@@ -309,7 +306,7 @@ void ngx_rtc_shm_source_subscribe / unsubscribe(ctx, src, sess);
 
 ## 4. 数据结构设计（shm 元数据）
 
-### 4.1 shm zone 总布局（阶段 0/1 已落地）
+### 4.1 shm zone 总布局
 
 单 zone `rtc`，根表 `ngx_rtc_shm_ctx_t` 存于 `shpool->data`（实际定义，见 `ngx_rtc_shm.h`）：
 
@@ -320,12 +317,12 @@ typedef struct {
     ngx_rbtree_node_t      source_sentinel;
     ngx_queue_t            source_list;   /* 全量 source（GC/统计用） */
     ngx_queue_t            session_list;  /* 全量 session 骨架链表（按 ufrag 线性查） */
-    ngx_uint_t             nworkers;      /* 阶段 1 未使用，阶段 2 环/唤醒再用 */
+    ngx_uint_t             nworkers;      /* number of workers */
 } ngx_rtc_shm_ctx_t;
 ```
 
-阶段 2 将在本结构追加 `ngx_fd_t notify_fd[NGX_MAX_PROCESSES]` 与 `ngx_rtc_ring_t *rings[NGX_MAX_PROCESSES]`
-（见第 5、6 节），阶段 1 暂不占用。
+媒体环与跨 worker 唤醒字段 `ngx_fd_t notify_fd[NGX_MAX_PROCESSES]` 与 `ngx_rtc_ring_t *rings[NGX_MAX_PROCESSES]`
+位于本结构（见第 5、6 节）。
 
 zone 声明（`ngx_rtc_core_module`，NGX_CORE_MODULE，已实现）：
 
@@ -375,7 +372,7 @@ struct ngx_rtc_shm_source_s {
 };
 ```
 
-- **没有** per-source `ngx_shmtx_t`（阶段 3 优化项）、**没有** GOP ring / video_body / audio_body / audio_ctx 等
+**没有** per-source `ngx_shmtx_t`（扩展项）、**没有** GOP ring / video_body / audio_body / audio_ctx 等
   进程内热路径状态——这些仍在进程内 `ngx_rtc_source_t`。
 - 分配：`ngx_shmtx_lock` + `ngx_slab_alloc_locked` + `ngx_rbtree_insert`；查找 `ngx_str_rbtree_lookup`。
 - `publishing`/SSRC/PT/seq/ts/SPS/PPS 由 bridge 与 http 双向同步（见 1.4）。
@@ -402,7 +399,7 @@ struct ngx_rtc_shm_session_s {
 （`ngx_rtc_core.h`）完整保留 dtls/srtp/fsm/conn/peer_addr/cipher/last_active/send_failed/send_eagain/
 queue/sub_queue/sn/dtls_timer，作为媒体平面唯一操作对象；shm session 只镜像 ufrag/pwd/PT/就绪/owner_slot/订阅。
 
-生命周期与并发约定（阶段 1 实际）：
+生命周期与并发约定：
 
 - HTTP worker：`ngx_rtc_session_add`（进程内）+ `ngx_rtc_shm_session_add`（shm）各建一份；
   私有 DTLS/SRTP/conn 在 UDP worker 绑定后才创建。
@@ -413,27 +410,27 @@ queue/sub_queue/sn/dtls_timer，作为媒体平面唯一操作对象；shm sessi
 - close：仅 `shm_sess->owner_slot == ngx_worker` 的 worker 删除 shm 骨架，防止信令 worker 的僵尸进程内
   session 被 reaper 关闭时误删活跃骨架。
 
-### 4.5 锁粒度（阶段 1 实际）
+### 4.5 锁粒度
 
 | 层级 | 锁 | 保护范围 | 状态 |
 |------|----|---------|------|
-| L0 | `shpool->mutex`（全局自旋锁，slab 自带） | 所有 shm 分配/释放、红黑树/队列头指针变更 | **阶段 1 已用** |
-| L1 | 每 source 一把 `ngx_shmtx_t` | `subscribers` 快照、seq/ts 推进、SPS/PPS 写 | 阶段 3（未开始） |
-| L2 | 每 worker ring 一把 `ngx_shmtx_t`（或 CAS head） | 环队列入队/出队 | **已实现**（每 ring 独立 `ring->mtx`）；无锁 CAS 属阶段 3 未做 |
+| L0 | `shpool->mutex`（全局自旋锁，slab 自带） | 所有 shm 分配/释放、红黑树/队列头指针变更 | **使用中** |
+| L1 | 每 source 一把 `ngx_shmtx_t` | `subscribers` 快照、seq/ts 推进、SPS/PPS 写 | 扩展项 |
+| L2 | 每 worker ring 一把 `ngx_shmtx_t`（或 CAS head） | 环队列入队/出队 | **已实现**（每 ring 独立 `ring->mtx`）；无锁 CAS 为扩展项 |
 
 **锁序铁律（防死锁）**：`pool->mutex` 只出现在 `ngx_slab_alloc/free` 内部，业务锁（source/ring）**必须
 在调用 slab 之前释放**；source 锁 → ring 锁单向，禁止反向。这与「L1 Singleton → L2 Context → L3 Device 禁反向」
 的既有约定一致。
 
-阶段 1 实际只用 L0 全局锁完成元数据正确性；媒体热路径（封装/GOP/SRTP）仍在进程内，不碰 shm 锁。
-每 source 锁是阶段 3 的纯优化，非正确性必需。
+元数据用 L0 全局锁保证正确性；媒体热路径（封装/GOP/SRTP）仍在进程内，不碰 shm 锁。
+每 source 锁是纯优化，非正确性必需。
 
 ---
 
-## 5. 与零拷贝环形队列的衔接（媒体本体，阶段 2 规划）
+## 5. 与零拷贝环形队列的衔接（媒体本体）
 
 > 注意：仓库中已存在的 `src/ngx_rtc_ring.c/h` 是**进程内 pthread 有界环形队列**，服务于 AAC→Opus 转码线程
-> （`ngx_rtc_audio_worker`），与本节的 shm 跨 worker 媒体环**无关**；阶段 2 的 shm 环尚未实现。
+> （`ngx_rtc_audio_worker`），与本节的 shm 跨 worker 媒体环**无关**。
 
 ### 5.1 为什么媒体不能零拷贝到 socket
 
@@ -526,18 +523,18 @@ ring 地址存进 `ctx->rings[w]`。环大小按「单 worker 缓冲窗口」估
 
 若 `owner_slot == 本 worker` 且本 worker 持有该 session 的 `priv`，RTMP worker 可直接在本进程内
 「SRTP 加密 + send」，省一次环往返。这是纯优化：第 1 版可统一走环（更简单、路径唯一），
-第 2 阶段再加直发快路径。两种路径共享同一份 subscriber 快照逻辑。
+同 worker 直发快路径为扩展项。两种路径共享同一份 subscriber 快照逻辑。
 
-### 5.6 双 registry 上的阶段 2 演进（规划）
+### 5.6 双 registry 上的媒体环集成
 
-阶段 2 启用 shm 媒体环时，无需推翻双 registry 方案：RTMP worker 仍按进程内 source 封装明文 RTP，按
+shm 媒体环的启用无需推翻双 registry 方案：RTMP worker 仍按进程内 source 封装明文 RTP，按
 `shm_sess->owner_slot` 分组写每 worker 环；消费端 UDP worker 用「shm session 指针/id」查本 worker 的进程内
 session，再走现有 `ngx_rtc_session_send_rtp` 做 SRTP + send。shm 骨架继续承担身份与订阅关系，进程内结构继续
-承担媒体热路径状态，二者职责与阶段 1 一致。同 worker 直发快路径（5.5）在阶段 3 叠加。
+承担媒体热路径状态，二者职责不变。同 worker 直发快路径（5.5）为扩展项。
 
 ---
 
-## 6. 事件通知（跨 worker 唤醒，阶段 2 规划）
+## 6. 事件通知（跨 worker 唤醒）
 
 ### 6.1 关键事实：`ngx_notify` 不能跨 worker
 
@@ -549,7 +546,7 @@ session，再走现有 `ngx_rtc_session_send_rtp` 做 SRTP + send。shm 骨架�
 
 利用 nginx 进程模型：模块 `init_process` 会**先**在 master 执行（`ngx_init_cycle` → `ngx_init_modules`，
 `src/core/ngx_cycle.c:652`），**然后**才 fork worker（`src/os/unix/ngx_process_cycle.c:374`），worker 内再次调用
-`init_process`（`src/os/unix/ngx_process_cycle.c:967`）。因此在 master 阶段创建的 eventfd 会被所有 worker 继承，
+`init_process`（`src/os/unix/ngx_process_cycle.c:967`）。因此在 master 进程（fork 前）创建的 eventfd 会被所有 worker 继承，
 且 **fd 号在各 worker 的 fd 表里一致**，任何 worker 都能写任何其他 worker 的 eventfd。
 
 ```c
@@ -586,11 +583,11 @@ uint64_t one = 1;
 
 ---
 
-## 7. 落地步骤（分阶段，最小改动）
+## 7. 实现分解
 
-> 阶段 0/1 已完成；阶段 2/3/4 保持规划。已实现内容以代码为准，本节记录计划与偏差。
 
-### 阶段 0：抽出共享核心与 zone 声明 —— 已完成
+
+### 7.0 共享核心与 zone 声明
 
 - 新增 `src/ngx_rtc_shm.c` / `src/ngx_rtc_shm.h`：`ngx_rtc_shm_ctx_t`、`rtc_zone` 指令、
   `ngx_rtc_core_module`（NGX_CORE_MODULE）、`ngx_rtc_core_init_zone`（照 limit_req 三段式）、
@@ -598,7 +595,7 @@ uint64_t one = 1;
 - `config` 已把 `ngx_rtc_shm.c` 编入 CORE 模块；`nginx.conf` 增加 `rtc_zone rtc:32m;`。
 - `ngx_rtc_core.c` 未删除，进程内注册表继续承担媒体平面（与原文「先保留旧接口做对照」一致，但定位转为长期共存）。
 
-### 阶段 1：元数据上 shm，信令/绑定先跨 worker 正确 —— 已完成
+### 7.1 元数据上 shm，信令/绑定跨 worker 正确
 
 - `ngx_rtc_http_module.c`：SSRC/PT 权威在 shm（`ngx_rtc_shm_source_get`，`video_ssrc==0` 才分配写回）；
   play 时 `ngx_rtc_shm_session_add` 加 session 骨架；进程内 session 仍 `ngx_alloc` 分配。
@@ -607,11 +604,11 @@ uint64_t one = 1;
   才删 shm 骨架（防 signaling worker 僵尸 session 被 reaper 误删活跃骨架）。
 - `ngx_rtmp_rtc_bridge_module.c`：`ngx_rtmp_rtc_sync_shm` 从 shm 同步 SSRC/PT（推流先来则分配写 shm）；
   close_stream 同步 shm `publishing=0` + remove。
-- **与原文偏差**：未按「session/source 拆 shm 骨架 + worker 私有扩展」的单一 registry 落地，而是双 registry 镜像
-  （见 0.4、1.4）。媒体仍是单 worker 语义（推流与 UDP 同 worker 才通），信令→绑定→订阅的跨 worker 一致性已成立。
+- **设计取舍**：未采用「session/source 拆 shm 骨架 + worker 私有扩展」的单一 registry，而是双 registry 镜像
+  （见 0.4、1.4）。媒体热路径仍在进程内，信令→绑定→订阅的跨 worker 一致性由 shm 保证。
   验收：HTTP 与 UDP 分属不同 worker 时，STUN 能找到 session、DTLS 能完成。
 
-### 阶段 2：媒体环形队列 + 跨 worker 唤醒 —— 已完成
+### 7.2 媒体环形队列 + 跨 worker 唤醒
 
 - 启用 `ctx->notify_fd[w]` 与 `ctx->rings[w]`（已追加到 `ngx_rtc_shm_ctx_t`）。
 - 实现 shm `ngx_rtc_shm_ring_t`（MPSC，每 ring 独立 `ring->mtx` 锁）与消费 handler；RTMP worker 按 `owner_slot`
@@ -619,19 +616,19 @@ uint64_t one = 1;
   UDP worker handler 读环 → 查本 worker 进程内 session → `ngx_rtc_session_send_rtp`。
 - `nginx.conf` 用 `worker_processes 2;`（未用 auto，可后续调），UDP listen 已增加 `reuseport`。
 - 验收：推流、信令、UDP 分散在不同 worker 时，浏览器可正常起播、连续播放（已端到端验证，丢包 0%、首帧约 550ms）。
-- 演进方式见 5.6（复用双 registry 分工，不推翻）。
+- 集成方式见 5.6（复用双 registry 分工，不推翻）。
 
-### 阶段 3：优化与收尾 —— 部分完成
+### 7.3 优化项
 
-- 已完成：媒体环改用每 ring 独立 `ring->mtx`（不再抢全局 `shpool->mutex`）；source 空/断连回收
+- 已实现：媒体环每 ring 独立 `ring->mtx`（不抢全局 `shpool->mutex`）；source 空/断连回收
   （`free_locked` 的 source GC + `close_requested` 踢人断流）；环满丢帧埋点（`ring_drops`）；
-  GOP 缓存升级为「关键帧 AU 快照下沉 shm」，任意 worker 订阅秒开。
-- 未完成：每 source 独立锁（L1）；ring 入队无锁 CAS（L2）；expire+LRU 强淘汰；同 worker 直发快路径。
+  GOP 缓存为「关键帧 AU 快照下沉 shm」，任意 worker 订阅秒开。
+- 扩展项：每 source 独立锁（L1）；ring 入队无锁 CAS（L2）；expire+LRU 强淘汰；同 worker 直发快路径。
 
-### 阶段 4（可选，跨机）：外部 relay —— 未开始
+### 7.4 跨机扩展：外部 relay（可选）
 
 - 复用 shm source/session 语义，把「环 + eventfd」替换为对外 UDP/RTMP relay，即可横向扩展，
-  与阶段 2 的 worker 内分发正交，互不影响。
+  与 worker 内分发正交，互不影响。
 
 ---
 
@@ -654,7 +651,7 @@ uint64_t one = 1;
 | nginx-rtmp 引用计数链（非跨 worker） | `/home/dgliu/workspace/webrtc/nginx-http-flv-module/ngx_rtmp_shared.c:12-126` |
 | 现有进程内注册表（保留，媒体平面主用） | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_core.c` |
 | 进程内 source/session 完整结构 | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_core.h` |
-| shm 骨架与 `rtc_zone`/init_zone（阶段 0/1） | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_shm.c`、`ngx_rtc_shm.h` |
+| shm 骨架与 `rtc_zone`/init_zone | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_shm.c`、`ngx_rtc_shm.h` |
 | http glue：SSRC/PT 权威 + session 骨架 add | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_http_module.c`（`ngx_rtc_shm_source_get`/`ngx_rtc_shm_session_add` 处） |
 | stream glue：attach_from_shm / DTLS done / close 删骨架 | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtc_stream_module.c:281-335`、`:644-695`、`:716-791` |
 | bridge glue：sync_shm / close_stream 同步 | `/home/dgliu/workspace/webrtc/ngx-rtc-module/src/ngx_rtmp_rtc_bridge_module.c:380-407`、`:186-235` |
@@ -667,8 +664,7 @@ uint64_t one = 1;
 - ring：单条目 1.5KB × 4096 ≈ 6MB/worker；`rtc_zone 32m` 在 4 worker + 1000 source + 10000 session 下
   约用 24MB（4×6MB 环 + ~11MB 元数据），留 8MB 余量。规模变化按 `8MB + N_worker×6MB + 源/会话数×1KB/0.4KB` 线性调整。
 
-> 阶段 1 实际结构**不含** `notify_fd[NGX_MAX_PROCESSES]` 与 `rings[NGX_MAX_PROCESSES]`，故当前 32m 更宽裕；
-> 上述估算保留为阶段 2 加环后的上界。
+> 共享内存按加环后的上界估算，32m 配置对当前结构有充足余量。
 
 ### 8.3 与既有代码约定的对齐
 
