@@ -104,6 +104,82 @@ cd build-win64/openresty-win64
 
 推流端连 RTMP 1935，播放端浏览器访问 `html/rtcplayer.html`（WebRTC UDP 8000）。
 
+## Linux MinGW 交叉编译（无 Windows 机器也可出包）
+
+没有 Windows 机器时，可以在 Linux 上用 MinGW 交叉编译出同样的 `nginx.exe`。
+这条路径已实测走通，但比 MSYS2 原生编译多几处手工补丁，适合 CI 或一次性出包。
+前提：本机已有 MinGW 交叉工具链（如 `$HOME/.local/mingw`）和 MSYS2 预编译包
+（openssl/pcre2/zlib/opus/libsrtp 的 `mingw64` 目录）。
+
+### 关键补丁一：OpenSSL windres 找不到 winver.h
+
+MinGW 的 `windres` 编译 OpenSSL 的 `.rc` 资源文件时，默认不继承 gcc 的
+include 搜索路径，也不定义 `_WIN32`。用一个 wrapper 补齐两处：
+
+```sh
+mkdir -p /tmp/winbin
+cat > /tmp/winbin/windres <<'EOF'
+#!/bin/sh
+exec "$HOME/.local/mingw/usr/bin/x86_64-w64-mingw32-windres" \
+    -D_WIN32 \
+    -I"$HOME/.local/mingw/usr/x86_64-w64-mingw32/include" \
+    "$@"
+EOF
+chmod +x /tmp/winbin/windres
+export PATH=/tmp/winbin:$PATH
+```
+
+同时把 `x86_64-w64-mingw32-gcc-posix` 链成无后缀入口，供 OpenResty/nginx 调用：
+
+```sh
+ln -sf "$HOME/.local/mingw/usr/bin/x86_64-w64-mingw32-gcc-posix" \
+    /tmp/winbin/x86_64-w64-mingw32-gcc
+```
+
+### 关键补丁二：完整版 FFmpeg 拖入 40+ 个 DLL
+
+MSYS2 的完整 ffmpeg 是动态库，依赖 x264/x265/libaom 等几十个编解码 DLL。
+本项目只用 AAC 解码，交叉编译成「只含 AAC」的静态库即可。命令已固化为
+[scripts/build-ffmpeg-min-mingw.sh](/home/dgliu/workspace/webrtc/nginx-rtc-example/scripts/build-ffmpeg-min-mingw.sh)：
+
+```sh
+./scripts/build-ffmpeg-min-mingw.sh
+```
+
+产出 `/tmp/winffmpeg-min/lib/{libavcodec,libavutil,libswresample}.a`。
+把这几个静态库和 opus/libsrtp 的动态导入库合成一个混合第三方目录：
+
+```sh
+THIRD=/tmp/winthird-min
+mkdir -p "$THIRD/lib" "$THIRD/include"
+cp /tmp/winffmpeg-min/lib/libavcodec.a \
+   /tmp/winffmpeg-min/lib/libavutil.a \
+   /tmp/winffmpeg-min/lib/libswresample.a "$THIRD/lib/"
+cp "$HOME/.local/mingw/mingw64/lib/libopus.dll.a" "$THIRD/lib/libopus.a"
+cp "$HOME/.local/mingw/mingw64/lib/libsrtp2.dll.a" "$THIRD/lib/libsrtp2.a"
+cp -r /tmp/winffmpeg-min/include/* "$THIRD/include/"
+cp -r "$HOME/.local/mingw/mingw64/include/opus" "$THIRD/include/"
+cp -r "$HOME/.local/mingw/mingw64/include/srtp2" "$THIRD/include/"
+```
+
+这样 `nginx.exe` 自包含 FFmpeg，运行时只需 5 个 DLL：`libopus-0.dll`、
+`libsrtp2-1.dll`、`libcrypto-3-x64.dll`、`libwinpthread-1.dll`、`lua51.dll`。
+
+### 交叉编译流程
+
+1. 下载 OpenResty 1.31.1.1 + OpenSSL/zlib/PCRE2 源码，解压。
+2. 给 OpenResty 源码打 5 处交叉编译补丁（LuaJIT `HOST_CC`、`liblua51.dll.a`
+   安装、`auto/init` 的 `autotest.exe`、lua-cjson / lua-redis-parser 链接顺序）。
+3. 交叉编译精简 FFmpeg，合成混合第三方目录，应用 windres wrapper。
+4. 用 `NGX_RTC_THIRD=$THIRD` 跑 OpenResty `configure`（带 `--crossbuild=win32`）
+   + `make` + `make install`。
+5. 收集 5 个运行时 DLL，复制 `deploy/nginx/{conf,html}`，把 `worker_processes`
+   改成 1，`rtmp_auto_push off`，打包分发。
+
+交叉编译版 `nginx.exe` 依赖 `bcrypt` 等 Windows 系统 API，因此链接行需补
+`-lbcrypt`；若 `make` 报 `undefined reference to BCrypt*`，在 `objs/Makefile`
+的链接行加 `-lbcrypt` 即可。
+
 ## 已知限制
 
 - Windows 版 nginx 仅支持 `select` 事件模型、单 worker，适合开发验证，不适合
