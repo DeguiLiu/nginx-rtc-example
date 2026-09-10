@@ -13,10 +13,27 @@ function _M.reload()
         return false
     end
 
-    shared:flush_all()
+    -- Publish the new keys first, then drop the ones that disappeared.
+    -- flush_all() before the set() loop would open a window in which a worker
+    -- serving a request sees an empty dict and denies a stream whose key is
+    -- about to be written back -- a reload that flaps live playback for no
+    -- reason. This order has no such window: every key is valid at all times,
+    -- and a key removed from stream_keys.lua stops being valid once the loop
+    -- finishes.
+    local stale = shared:get_keys(0)
+    local fresh = {}
+
     for k, v in pairs(cfg) do
         shared:set(k, tostring(v))
+        fresh[k] = true
     end
+
+    for _, k in ipairs(stale) do
+        if not fresh[k] then
+            shared:delete(k)
+        end
+    end
+
     return true
 end
 

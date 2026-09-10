@@ -25,7 +25,7 @@ deploy/nginx/
   html/                 rtcplayer.html / flv.min.js（flv.js v1.6.2）/ hmac-sha256.js
 client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
-docs/                   设计、评估、实现指南（中文）
+docs/                   设计、评估、实现指南、nginx 编程规范（中文）
 run.sh                  sync / nginx / push / keep-push / stop / verify
 ```
 

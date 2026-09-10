@@ -20,4 +20,11 @@ end
 -- the FLV body request ends, so /rtc/v1/flvcnt sees a cross-worker-accurate
 -- "viewers right now" per stream. init_ttl 300s self-heals any viewer whose log
 -- phase never ran (abrupt worker death), capping phantom counts.
-ngx.shared.rtc_stats:incr("flvcnt:" .. app .. "/" .. stream, 1, 0, 300)
+--
+-- ngx.ctx is the access -> log handoff ("this request is the one that counted
+-- itself"), so the log-phase hook can tell an authorized viewer apart from a
+-- request rejected above. Do not drop it: flv_close.lua has no other way to
+-- know whether it is allowed to decrement.
+local key = "flvcnt:" .. app .. "/" .. stream
+ngx.ctx.flvcnt_key = key
+ngx.shared.rtc_stats:incr(key, 1, 0, 300)

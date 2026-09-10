@@ -23,7 +23,20 @@ const MAX_RTP_PAYLOAD = 1200;
 const API = process.env.WHIP_API || "http://127.0.0.1:18082";
 const APP = process.env.WHIP_APP || "live";
 const STREAM = process.env.WHIP_STREAM || "whiptest";
+
+// Bounded signaling: without an AbortSignal a hung /whip/endpoint request makes
+// this script wait forever, which in turn hangs scripts/e2e-whip-release.sh.
+// Same idiom as client/play.mjs.
+const SIGNAL_TIMEOUT_MS = 5000;
+
 const DURATION = Number.parseInt(process.env.WHIP_DURATION || "10000", 10);
+if (!Number.isFinite(DURATION) || DURATION <= 0) {
+  // parseInt gives NaN for a typo'd value, and setTimeout(fn, NaN) fires on the
+  // next tick -- the publisher would exit immediately and the callers below
+  // would read that as "the stream ended", not "the duration was invalid".
+  log(`[FAIL] WHIP_DURATION must be a positive number of ms, got ${JSON.stringify(process.env.WHIP_DURATION)}`);
+  process.exit(1);
+}
 
 function log(msg) {
   writeSync(1, msg + "\n");
@@ -68,7 +81,6 @@ function createH264Track() {
   let timestamp = 0;
   const ssrc = 0x2a2b3c00;
   let annexB = Buffer.alloc(0);
-  let frameSeq = 0;
 
   const findStartCode = (buf, from) => {
     for (let i = from; i < buf.length - 3; i++) {
@@ -173,7 +185,6 @@ function createH264Track() {
       sendRtp(frames[i], i === frames.length - 1);
     }
 
-    frameSeq++;
     timestamp = (timestamp + (H264_CLOCK / VIDEO_FPS)) >>> 0;
   };
 
@@ -230,6 +241,7 @@ async function main() {
       method: "POST",
       headers: { "Content-Type": "application/sdp" },
       body: offer.sdp,
+      signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
     }
   );
 
