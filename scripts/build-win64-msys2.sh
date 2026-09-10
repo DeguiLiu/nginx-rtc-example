@@ -8,9 +8,11 @@
 #   nginx-rtc-module        RTMP/WHIP -> WebRTC (SRTP over UDP)
 #   nginx-http-flv-module   RTMP core the bridge links against
 #
-# Third-party media libs (FFmpeg/opus/libsrtp) come from MSYS2 pacman packages
-# and are exposed to the addon as NGX_RTC_THIRD=/mingw64. OpenSSL/PCRE2/zlib
-# are built from source by OpenResty, exactly like the upstream Windows build.
+# FFmpeg is cross-built as a minimal AAC-only shared library (the pacman full
+# ffmpeg drags in x264/x265/libaom and dozens of codec DLLs). opus/libsrtp stay
+# as pacman DLL import libs. The three are merged into a mixed third-party tree
+# and exposed to the addon as NGX_RTC_THIRD. OpenSSL/PCRE2/zlib are built from
+# source by OpenResty, exactly like the upstream Windows build.
 #
 # Usage (inside MINGW64):
 #   ./scripts/build-win64-msys2.sh
@@ -36,6 +38,7 @@ ORX="openresty-$ORX_VER"
 PCRE=pcre2-10.47
 ZLIB=zlib-1.3.2
 OPENSSL=openssl-3.5.6
+FFMPEG_VER=n8.0
 # The win32-compat branch carries the MinGW .dll.a / winpthread config fix; the
 # released v0.3.0 tag predates it. Override with NGX_RTC_MODULE_SRC for a local
 # checkout while iterating.
@@ -44,17 +47,16 @@ HFLV_VER=v1.2.14
 
 mkdir -p "$SRC"
 
-echo "== [1/6] install mingw64 toolchain + rtc third-party libs =="
+echo "== [1/8] install mingw64 toolchain + rtc third-party libs =="
 pacman -S --needed --noconfirm \
     mingw-w64-x86_64-toolchain \
     base-devel \
     perl \
-    mingw-w64-x86_64-ffmpeg \
     mingw-w64-x86_64-opus \
     mingw-w64-x86_64-libsrtp \
     wget git unzip tar
 
-echo "== [2/6] download OpenResty + static dep sources =="
+echo "== [2/8] download OpenResty + static dep sources =="
 cd "$SRC"
 [ -s "$ORX.tar.gz" ] || wget -O "$ORX.tar.gz" \
     "https://openresty.org/download/$ORX.tar.gz"
@@ -66,8 +68,10 @@ cd "$SRC"
     "https://github.com/PCRE2Project/pcre2/releases/download/$PCRE/$PCRE.tar.gz"
 
 [ -d "$ORX" ] || tar -xzf "$ORX.tar.gz"
+[ -d "$SRC/FFmpeg/.git" ] || git clone -q --depth 1 --branch "$FFMPEG_VER" \
+    https://github.com/FFmpeg/FFmpeg "$SRC/FFmpeg"
 
-echo "== [3/6] clone the two addon modules =="
+echo "== [3/8] clone the two addon modules =="
 if [ -n "${NGX_RTC_MODULE_SRC:-}" ]; then
     MOD="$NGX_RTC_MODULE_SRC"
     echo "  nginx-rtc-module: local override $MOD"
@@ -80,11 +84,35 @@ HFLV="$SRC/nginx-http-flv-module"
 [ -d "$HFLV/.git" ] || git clone -q --depth 1 --branch "$HFLV_VER" \
     https://github.com/winshining/nginx-http-flv-module "$HFLV"
 
-echo "== [4/6] patch http-flv int8_t guard for MinGW =="
+echo "== [4/8] patch http-flv int8_t guard for MinGW =="
 sed -i 's/#if (NGX_WIN32)/#if (NGX_WIN32 \&\& defined(_MSC_VER))/' \
     "$HFLV/ngx_rtmp.h"
 
-echo "== [5/6] extract static deps + configure =="
+echo "== [5/8] build minimal AAC-only FFmpeg (shared) =="
+FFMIN="$BUILD/ffmpeg-min"
+( cd "$SRC/FFmpeg" \
+    && ./configure --prefix="$FFMIN" \
+        --disable-everything --disable-programs --disable-doc \
+        --disable-network --disable-autodetect --disable-x86asm \
+        --disable-avdevice --disable-avformat --disable-avfilter \
+        --disable-swscale --disable-postproc \
+        --enable-avcodec --enable-avutil --enable-swresample \
+        --enable-decoder=aac --enable-parser=aac --enable-demuxer=aac \
+        --enable-protocol=file \
+        --enable-shared --disable-static \
+    && make -j"$JOBS" \
+    && make install )
+
+echo "== [6/8] assemble mixed third-party tree =="
+THIRD="$BUILD/third"
+rm -rf "$THIRD"
+mkdir -p "$THIRD/lib" "$THIRD/include"
+cp "$FFMIN/lib/"*.dll.a "$THIRD/lib/"
+cp /mingw64/lib/libopus.dll.a /mingw64/lib/libsrtp2.dll.a "$THIRD/lib/"
+cp -r "$FFMIN/include/"* "$THIRD/include/"
+cp -r /mingw64/include/opus /mingw64/include/srtp2 "$THIRD/include/"
+
+echo "== [7/8] extract static deps + configure =="
 cd "$SRC/$ORX"
 rm -rf objs
 mkdir -p objs/lib
@@ -97,7 +125,7 @@ cd "$SRC/$ORX"
 (cd "objs/lib/$OPENSSL" \
     && patch -p1 < "../../../patches/openssl-3.5.5-sess_set_get_cb_yield.patch")
 
-NGX_RTC_THIRD=/mingw64 ./configure \
+NGX_RTC_THIRD="$THIRD" ./configure \
     --with-cc=gcc \
     --prefix="$OUT" \
     --with-cc-opt='-DFD_SETSIZE=1024' \
@@ -135,7 +163,7 @@ NGX_RTC_THIRD=/mingw64 ./configure \
     --add-module="$HFLV" \
     -j"$JOBS"
 
-echo "== [6/6] make && make install =="
+echo "== [8/8] make && make install =="
 make -j"$JOBS"
 make install
 
@@ -148,7 +176,9 @@ collect_dlls() {
     objdump -p "$exe" 2>/dev/null \
         | sed -n 's/.*DLL Name: \(.*\)/\1/p' \
         | while read -r dll; do
-            local src="/mingw64/bin/$dll"
+            local src=""
+            [ -f "/mingw64/bin/$dll" ] && src="/mingw64/bin/$dll"
+            [ -f "$FFMIN/bin/$dll" ] && src="$FFMIN/bin/$dll"
             if [ -f "$src" ] && [ ! -f "$OUT/$dll" ]; then
                 cp "$src" "$OUT/"
                 collect_dlls "$src"
