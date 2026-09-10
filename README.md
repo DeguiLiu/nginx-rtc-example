@@ -12,6 +12,15 @@ Pipeline:
 ffmpeg/WHIP → nginx (RTMP/HTTP) → module (bridge → shm media ring → SRTP/UDP) → browser WebRTC
 ```
 
+Both player pages below run against the same live stream; the wall clock burned into the top-left corner is what makes the latency difference readable at a glance:
+
+| HTTP-FLV (`/flvplayer`) | WebRTC (`/rtcplayer.html`) |
+|---|---|
+| ![HTTP-FLV player](docs/images/HTTP-FLV.png) | ![WebRTC player](docs/images/webrtc.png) |
+
+<!-- docs/images/webrtc.png is still a generated placeholder. Drop the real
+     /rtcplayer.html capture in at the same path and this table needs no edit. -->
+
 ## Repos
 
 The C code lives in its own public repo, [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module) (MIT). This repo keeps only the glue: deploy config + Lua, player pages, client scripts, build/ops scripts, and docs. See `docs/` for architecture, multi-worker shm design, and evaluation notes.
@@ -26,6 +35,7 @@ deploy/nginx/
 client/                 play.mjs (play), whip_push.mjs (WHIP push)
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
 docs/                   design, evaluation, implementation guides, nginx coding standards (Chinese)
+  images/               README screenshots
 run.sh                  sync / nginx / push / keep-push / stop / verify
 ```
 
