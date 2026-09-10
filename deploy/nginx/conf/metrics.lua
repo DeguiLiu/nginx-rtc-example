@@ -76,4 +76,24 @@ for _, s in ipairs(d.streams or {}) do
     sample("rtc_send_eagain", labels, s.send_eagain or 0)
 end
 
+-- Session lifecycle states, from a count the C side takes over the whole shm
+-- session list. That list, not the per-stream arrays, is what makes a session
+-- wedged in NEW or mid-handshake visible: it has not subscribed yet, and a WHIP
+-- publisher never subscribes at all. This is the series to alert on when
+-- viewers connect but no picture appears -- a plateau on ICE_BOUND or
+-- DTLS_HANDSHAKE names the step that is stuck.
+--
+-- CLOSED is not a label and is never counted: a closed session leaves the
+-- registry outright, so it would read as a permanently-zero series, which says
+-- "nothing ever closes" rather than "this one did". Emit every other state even
+-- at zero, so a transition is a visible step rather than a disappearing series.
+local SESSION_STATES = { "UNKNOWN", "NEW", "ICE_BOUND", "DTLS_HANDSHAKE",
+                         "SRTP_READY" }
+help("rtc_sessions", "Live RTC sessions by lifecycle state.")
+typ("rtc_sessions", "gauge")
+for _, state in ipairs(SESSION_STATES) do
+    sample("rtc_sessions", { state = state },
+           (d.session_states or {})[state] or 0)
+end
+
 ngx.print(table.concat(out, "\n"))
