@@ -35,7 +35,7 @@ run.sh                  sync / nginx / push / keep-push / stop / verify
 
 | 依赖 | 形式 | 版本/来源 |
 |---|---|---|
-| nginx-rtc-module | build 时浅克隆 | v0.2.0（DeguiLiu/nginx-rtc-module，MIT） |
+| nginx-rtc-module | build 时浅克隆 | v0.4.0（DeguiLiu/nginx-rtc-module，MIT） |
 | OpenResty | build 时拉 tarball | 1.31.1.1（openresty.org） |
 | nginx-http-flv-module | build 时浅克隆 | v1.2.14（winshining/nginx-http-flv-module） |
 | Opus | build 时拉 tarball | 1.3.1（xiph/opus） |
@@ -53,7 +53,7 @@ run.sh                  sync / nginx / push / keep-push / stop / verify
 scripts/setup.sh
 
 # 模块 host 单测在模块仓做（不需要 nginx/ffmpeg）：
-#   git clone --depth 1 --branch v0.2.0 https://github.com/DeguiLiu/nginx-rtc-module
+#   git clone --depth 1 --branch v0.4.0 https://github.com/DeguiLiu/nginx-rtc-module
 #   make -C nginx-rtc-module/test test
 
 # 拉全部依赖源（已缓存秒过；github 被墙的主机先 export HTTPS_PROXY=http://127.0.0.1:7890）

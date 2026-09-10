@@ -33,7 +33,7 @@ gitc() { # <url> <ref> <name>  -> shallow clone a pinned git ref into cache
 
 # Self-developed C addon (public MIT) + http-flv (RTMP core the bridge links
 # against). Bump refs here when a dependency advances.
-gitc https://github.com/DeguiLiu/nginx-rtc-module        v0.3.0 nginx-rtc-module
+gitc https://github.com/DeguiLiu/nginx-rtc-module        v0.4.0 nginx-rtc-module
 gitc https://github.com/winshining/nginx-http-flv-module v1.2.14 nginx-http-flv-module
 
 # libsrtp (SRTP) + FFmpeg (aac decode subset) - git tags, no release tarballs

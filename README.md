@@ -35,7 +35,7 @@ Nothing is vendored: neither the module nor third-party C source. `scripts/fetch
 
 | Dependency | Form | Version / source |
 |---|---|---|
-| nginx-rtc-module | shallow clone at build time | v0.2.0 (DeguiLiu/nginx-rtc-module, MIT) |
+| nginx-rtc-module | shallow clone at build time | v0.4.0 (DeguiLiu/nginx-rtc-module, MIT) |
 | OpenResty | tarball at build time | 1.31.1.1 (openresty.org) |
 | nginx-http-flv-module | shallow clone at build time | v1.2.14 (winshining/nginx-http-flv-module) |
 | Opus | tarball at build time | 1.3.1 (xiph/opus) |
@@ -53,7 +53,7 @@ Prebuilt libs land in `build/third/{include,lib}`. The module's addon `config` f
 scripts/setup.sh
 
 # module host unit tests run in the module repo (no nginx/ffmpeg needed):
-#   git clone --depth 1 --branch v0.2.0 https://github.com/DeguiLiu/nginx-rtc-module
+#   git clone --depth 1 --branch v0.4.0 https://github.com/DeguiLiu/nginx-rtc-module
 #   make -C nginx-rtc-module/test test
 
 # fetch all dependency sources (cached runs are instant; on github-blocked
