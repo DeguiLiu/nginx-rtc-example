@@ -9,6 +9,9 @@ return {
     ["live/livestream_540p"] = "demo-secret-0123456789abcdef0123456789abcdef",
     ["live/livestream_360p"] = "demo-secret-0123456789abcdef0123456789abcdef",
     ["live/whiptest"] = "demo-secret-0123456789abcdef0123456789abcdef",
+    -- Reserved for scripts/e2e-play-json.sh so the two e2e guards never contend
+    -- for the same name (a claimed name would make the other one's publish fail).
+    ["live/playjson"] = "demo-secret-0123456789abcdef0123456789abcdef",
     ["live/test"] = "test-secret-4567890abcdef0123456789abcdef",
     ["live/hotreload"] = "hot-secret-67890abcdef0123456789abcdef0",
     ["live/luahotload"] = "lua-secret-abcdef0123456789abcdef012345",

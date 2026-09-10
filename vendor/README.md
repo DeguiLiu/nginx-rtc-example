@@ -17,6 +17,17 @@
 > 网络: github.com 被 DNS 劫持的主机, 拉取前先
 > `export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890`。
 
+## 运行时工具(非编译源码)
+
+| 工具 | 用途 | 钉住 ref | 来源 |
+|---|---|---|---|
+| ngxtop | `run.sh ngxtop` 的控制面实时 QPS/耗时/状态码面板, 解析 `log_format rtc` | 0.0.3 | lebinh/ngxtop(MIT, Python) |
+
+由 `../scripts/fetch-deps.sh` 经 pip 装到 `../scripts/_cache/ngxtop`(含
+docopt/tabulate/pyparsing), 不入库。走 pip 而非 github: 本机 github 直连不可达, 且
+0.0.3 提供 py2.py3 的 wheel。该步骤失败只告警, 不影响编译; 装了系统级 `ngxtop` 时
+`run.sh ngxtop` 优先用系统版本。
+
 ## 内嵌的第三方运行时资产(非编译源码)
 
 `../deploy/nginx/html/flv.min.js` — **flv.js v1.6.2** 发行版 dist (bilibili/flv.js, Apache-2.0),

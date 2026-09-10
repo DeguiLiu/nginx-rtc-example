@@ -396,16 +396,24 @@ function renderServerStats(d) {
   }
   let html = `<table><thead><tr>
     <th>流</th><th>发布</th><th>观众</th>
-    <th>会话 TWCC(丢/收)</th>
+    <th>会话 TWCC(丢/收) · pacer · 丢弃(pacer/gop)</th>
     <th>视频SSRC</th><th>PT</th><th>包</th><th>字节</th>
     <th>音频SSRC</th><th>PT</th><th>包</th><th>字节</th>
   </tr></thead><tbody>`;
   d.streams.forEach(s => {
+    // pacer 目标码率与丢弃计数是区分"链路丢包"和"服务端自己丢包"的依据：
+    // pacer 丢弃的包仍带 RTP 序号，接收端会把它算成丢包，丢包驱动的 AIMD 就会把
+    // 自己的丢弃读成拥塞。pacer 掉到下限（64 kbps）而"弃"持续增长即为自锁。
     const sess = (s.sessions || []).map(x =>
-      `#${x.id} ${x.twcc_lost}/${x.twcc_received}`).join(" ");
+      `#${x.id} ${x.twcc_lost}/${x.twcc_received} · ${fmtKbps(x.pacer_bps)}` +
+      ` · 弃 ${x.drop_pacer || 0}/${x.drop_gop || 0}`).join("<br>");
+    const sessTitle = (s.sessions || []).map(x =>
+      `#${x.id}: pacer 目标 ${fmtKbps(x.pacer_bps)}，` +
+      `pacer 丢弃 ${x.drop_pacer || 0} 包，等 IDR 丢弃 ${x.drop_gop || 0} 包`
+    ).join("\n");
     html += `<tr>
       <td>${s.name}</td><td>${s.publishing ? "是" : "否"}</td><td>${s.clients}</td>
-      <td>${sess || "—"}</td>
+      <td title="${sessTitle}">${sess || "—"}</td>
       <td>${s.video.ssrc}</td><td>${s.video.pt}</td><td>${s.video.packets}</td><td>${s.video.octets}</td>
       <td>${s.audio.ssrc}</td><td>${s.audio.pt}</td><td>${s.audio.packets}</td><td>${s.audio.octets}</td>
     </tr>`;
@@ -413,6 +421,9 @@ function renderServerStats(d) {
   html += `</tbody></table>`;
   html += `<div class="stat">流总数 ${d.total_streams} · 观众总数 ${d.total_clients} · ` +
           `视频字节 ${d.total_video_octets} · 音频字节 ${d.total_audio_octets}</div>`;
+  html += `<div class="stat">会话列：#id 丢/收 · pacer 目标 · 弃 pacer/等IDR。` +
+          `pacer 目标掉到 64 kbps 且"弃"持续增长 = 服务端自己在丢包（拥塞控制自锁），` +
+          `不是链路丢包。</div>`;
   el.serverStats.innerHTML = html;
 }
 

@@ -55,5 +55,19 @@ if [ ! -s "$CACHE/$ORX_TAR" ]; then
     curl -fsSL "https://openresty.org/download/$ORX_TAR" -o "$CACHE/$ORX_TAR"
 fi
 
+# ngxtop - control-plane access-log metrics behind `run.sh ngxtop`. A runtime
+# tool, not a build input, so a failure here only warns: nothing in the
+# toolchain depends on it. Fetched through pip rather than github (this host
+# cannot reach github directly, and 0.0.3 ships as a py2.py3 wheel); --target
+# keeps it out of the repo and bundles its deps in the same tree.
+if [ ! -d "$CACHE/ngxtop/ngxtop" ]; then
+    echo "[pip ] ngxtop 0.0.3 (+ docopt/tabulate/pyparsing)"
+    python3 -m pip install --quiet --disable-pip-version-check \
+        --target "$CACHE/ngxtop" ngxtop==0.0.3 \
+        || python3 -m pip install --quiet --disable-pip-version-check \
+               --target "$CACHE/ngxtop" ngxtop \
+        || echo "[warn] ngxtop not installed; 'run.sh ngxtop' needs it" >&2
+fi
+
 echo "[done] deps cached under $CACHE"
 ls -la "$CACHE"

@@ -5,7 +5,12 @@
 local cjson = require "cjson"
 local config = require "config"
 
-ngx.log(ngx.ERR, "rtc_auth: ENTER remote=", ngx.var.remote_addr, " ct=", ngx.var.content_type, " len=", ngx.var.content_length)
+-- Log levels: server-side failures (limiter init / runtime) and authorization
+-- denials stay at ERR -- nginx's own auth_basic logs "user not found" /
+-- "password mismatch" at ERR too. Malformed client input is a bad request, not
+-- a server error, so it goes to INFO (nginx core logs "client sent invalid ..."
+-- at INFO); otherwise any scanner spraying this endpoint fills error.log.
+-- Successful plays are not logged at all: the access log already has them.
 
 -- Rate limit: 30 play requests/min per client IP (leaky bucket via the
 -- official lua-resty-limit-traffic). Requests within the burst allowance are
@@ -18,7 +23,7 @@ if not lim then
     return ngx.exit(500)
 end
 
-local delay, err = lim:incoming(ngx.var.binary_remote_addr, true)
+local delay, err = lim:incoming("play:" .. ngx.var.binary_remote_addr, true)
 if not delay then
     if err == "rejected" then
         ngx.status = 429
@@ -35,20 +40,20 @@ end
 ngx.req.read_body()
 local body = ngx.req.get_body_data()
 if not body then
-    ngx.log(ngx.ERR, "rtc_auth: no request body")
+    ngx.log(ngx.INFO, "rtc_auth: no request body")
     return ngx.exit(400)
 end
 
 local ok, req = pcall(cjson.decode, body)
 if not ok or "table" ~= type(req) or "string" ~= type(req.streamurl) then
-    ngx.log(ngx.ERR, "rtc_auth: bad json, body_len=", #body, " decode_ok=", tostring(ok))
+    ngx.log(ngx.INFO, "rtc_auth: bad json, body_len=", #body, " decode_ok=", tostring(ok))
     return ngx.exit(400)
 end
 
 -- Parse app/stream from webrtc://host/app/stream.
 local app, stream = req.streamurl:match("^webrtc://[^/]+/([^/]+)/([^/]+)$")
 if not app or not stream then
-    ngx.log(ngx.ERR, "rtc_auth: bad streamurl=", tostring(req.streamurl))
+    ngx.log(ngx.INFO, "rtc_auth: bad streamurl=", tostring(req.streamurl))
     return ngx.exit(400)
 end
 
@@ -57,5 +62,3 @@ if not config.verify(app .. "/" .. stream, req.t, req.sign) then
             " t=", tostring(req.t), " sign=", tostring(req.sign))
     return ngx.exit(403)
 end
-
-ngx.log(ngx.ERR, "rtc_auth: PASS app=", app, " stream=", stream)
