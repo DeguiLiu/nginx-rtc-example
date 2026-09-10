@@ -1,10 +1,14 @@
 # Build outputs & caches
 build/
+dist/
 scripts/_cache/
 *.o
 *.a
 *.so
 *.so.*
+*.exe
+*.dll
+*.zip
 
 # Node client deps (client/werift etc.)
 node_modules/
