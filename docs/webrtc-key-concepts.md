@@ -66,22 +66,22 @@ not received / received small delta / received large or negative delta 状态压
 接收方向：解析 TWCC 反馈并统计丢包/收到数。
 
 ```text
-客户端 RTP 上行（带 transport-cc 扩展）
-      → 服务端 srtp_unprotect_rtp 解密
+播放端 RTCP TWCC 反馈（SRTCP）
+      → ngx_rtc_srtp_unprotect_rtcp 解密
       → ngx_rtc_rtcp_parse 识别 RTPFB/FMT=15
       → ngx_rtc_rtcp_parse_twcc 解析 chunk
-      → sess->twcc_lost / twcc_received 累计
-      → ngx_rtc_shm_session_set_twcc 镜像到 shm
-      → render_stats 输出到 /rtc/v1/stats 与网页
+      → ngx_rtc_session_on_twcc 累计 twcc_lost/twcc_received 并调整 pacer
+      → ngx_rtc_shm_session_set_stats 镜像到 shm
+      → ngx_rtc_http_render_stats 输出到 /rtc/v1/stats 与网页
 ```
 
 相关代码：
 
-- `src/ngx_rtc_core.c`：transport-cc 头扩展写入。
+- `src/ngx_rtc_core.c`：transport-cc 头扩展写入；`ngx_rtc_session_on_twcc` 累计与 pacer 调整。
 - `src/ngx_rtc_rtcp.c`：`ngx_rtc_rtcp_parse_twcc`。
 - `src/ngx_rtc_rtcp.h`：`NGX_RTC_RTCP_FMT_TWCC` 与 twcc 字段。
-- `src/ngx_rtc_stream_module.c`：累计与 shm 同步。
-- `src/ngx_rtc_shm.h` / `src/ngx_rtc_shm.c`：`twcc_lost/twcc_received` 与同步函数。
+- `src/ngx_rtc_stream_module.c`：SRTCP 解析入口与 shm 同步。
+- `src/ngx_rtc_shm.h` / `src/ngx_rtc_shm.c`：`twcc_lost/twcc_received` 与 `ngx_rtc_shm_session_set_stats`。
 
 ---
 
@@ -159,25 +159,30 @@ worker，该 worker 本地 source 的 GOP 环为空，回放落空，首帧只�
 ### 本项目落地
 
 ```text
-shm source 内
-  snapshot_count : 当前快照包数
-  snapshot_cap   : 固定容量（256）
-  snapshot[]     : 明文 RTP 包数组
+shm source 内（跨 worker 回放）
+  retransmit->slots[]   : 明文 RTP 包环，容量 NGX_RTC_SHM_RETX_RING_CAP（1024）
+  slot.is_gop_start     : 标记该包为 IDR 访问单元的起始包
+  retransmit->gop_start : 最新 IDR 起始包的绝对下标
 ```
 
 ```c
 typedef struct {
-    u_char     data[NGX_RTC_RING_RTP_MAX];
-    ngx_uint_t len;
-} ngx_rtc_shm_gop_snapshot_pkt_t;
+    uint16_t    len;          /* valid bytes in data */
+    uint8_t     is_gop_start; /* first packet of an IDR access unit */
+    u_char      data[NGX_RTC_RING_RTP_MAX];
+} ngx_rtc_shm_retransmit_slot_t;
 ```
 
-生产者每遇 IDR 重置一次快照，逐包追加；消费者（订阅/PLI 回放）遍历快照逐包发送。
+生产者每遇 IDR 起始包更新 `gop_start`，逐包追加；消费者（订阅/PLI 回放）从 `gop_start` 起逐包发送，遇
+RTP marker 结束。同 worker 的订阅者走进程内 `ngx_rtc_source_t.gop`（`ngx_rtc_rtp_ring_t`，容量由
+`rtc_gop_ring_slots` 决定，默认 `NGX_RTC_GOP_RING_CAP` 2048），跨 worker 才读 shm 环。
 
 相关代码：
 
-- `src/ngx_rtc_shm.h`：快照结构。
-- `src/ngx_rtc_shm.c`：`snapshot_reset/append/replay`。
+- `src/ngx_rtc_shm.h`：`ngx_rtc_shm_retransmit_t` 与 `ngx_rtc_shm_retransmit_slot_t`。
+- `src/ngx_rtc_shm.c`：`ngx_rtc_shm_retransmit_append` / `ngx_rtc_shm_retransmit_get` /
+  `ngx_rtc_shm_retransmit_replay_gop`。
+- `src/ngx_rtc_core.c`：进程内 GOP 环 `ngx_rtc_rtp_ring_push` / `ngx_rtc_rtp_ring_replay`。
 - `src/ngx_rtmp_rtc_bridge_module.c`：RTMP 生产者累积。
 - `src/ngx_rtc_stream_module.c`：WHIP 生产者累积 + 订阅回放。
 
@@ -188,8 +193,8 @@ typedef struct {
 ### 正式定义
 
 IDR（Instantaneous Decoder Refresh）是 H.264 的一种特殊帧，包含一张完整可独立解码的图像，并强制解码器
-清空参考帧缓冲。IDR 重置指：每当新的 IDR 关键帧 AU 到来，就把关键帧快照的写入位置清零，从这一帧重新
-开始累积，保证快照始终对应最新的一张关键帧。
+清空参考帧缓冲。IDR 重置指：每当新的 IDR 关键帧 AU 到来，就把关键帧缓存的有效起点前移，从这一帧重新
+开始累积，保证回放始终对应最新的一张关键帧。
 
 ### 作用
 
@@ -199,18 +204,20 @@ IDR（Instantaneous Decoder Refresh）是 H.264 的一种特殊帧，包含一�
 
 ### 本项目落地
 
-生产者判断到 H264 STAP-A（SPS/PPS 聚合包，标志关键帧 AU 开始）时调用：
+生产者判断到 H264 STAP-A（SPS/PPS 聚合包，标志关键帧 AU 开始）时，把 `is_gop_start` 传给追加函数
+（跨 worker 为 `ngx_rtc_shm_retransmit_append`，同 worker 为 `ngx_rtc_rtp_ring_push`）：
 
 ```c
-ngx_rtc_shm_gop_snapshot_reset(ctx, name, len);
+ngx_rtc_shm_retransmit_append(ctx, src, rtp, len, 1 /* is_gop_start */);
 ```
 
-该函数在锁内把 `src->snapshot_count` 置 0，随后进入累积状态（snapshot_active = 1）。
+该函数在锁内把该 slot 的 `is_gop_start` 置 1，并把环的 `gop_start` 更新为当前写下标；回放从
+`gop_start` 起，效果等价于把旧内容作废，只保留最新一张关键帧。
 
 相关代码：
 
-- `src/ngx_rtmp_rtc_bridge_module.c`：RTMP 生产者 is_gop_start 触发 reset。
-- `src/ngx_rtc_stream_module.c`：WHIP 生产者识别 STAP-A 触发 reset。
+- `src/ngx_rtmp_rtc_bridge_module.c`：RTMP 生产者 is_gop_start 触发。
+- `src/ngx_rtc_stream_module.c`：WHIP 生产者识别 STAP-A 触发。
 
 ---
 
@@ -235,13 +242,12 @@ FU-A 分片」依次追加，直到该帧结束，得到一份完整、可立即
 
 ```text
 STAP-A 到达（is_gop_start=1）
-  ├─ snapshot_reset（清空）
-  ├─ snapshot_append（存 SPS/PPS）
-  └─ snapshot_active = 1
+  ├─ 置 slot.is_gop_start = 1（存 SPS/PPS）
+  └─ gop_start = 当前写下标
 IDR 的 FU-A 逐个到达
-  └─ snapshot_append（逐个追加主体分片）
+  └─ append（逐个追加主体分片）
 最后一个 FU-A（RTP marker 位 = 1）
-  └─ snapshot_active = 0（本关键帧 AU 完成）
+  └─ 回放循环在此结束（本关键帧 AU 完成）
 ```
 
 关键判定：`rtp[1] & 0x80` 即 RTP 头 M（marker）位，为 1 表示该帧最后一个包。
@@ -309,8 +315,8 @@ flowchart LR
     WHIP[WHIP 推流] -->|SDP answer<br/>a=recvonly| SDP[SDP 协商]
     SDP --> SRTP[SRTP 媒体上行]
     SRTP --> STAP[识别 STAP-A]
-    STAP --> RESET[IDR 重置<br/>snapshot_reset]
-    RESET --> APPEND[追加 STAP-A+IDR<br/>snapshot_append]
+    STAP --> RESET[IDR 重置<br/>gop_start 前移]
+    RESET --> APPEND[追加 STAP-A+IDR<br/>retransmit_append]
     APPEND --> SNAP[关键帧 AU 快照]
     SNAP --> REPLAY[跨 worker 订阅回放<br/>秒开首帧]
     SRTP --> TWCC[TWCC 反馈<br/>丢包统计]
@@ -339,13 +345,13 @@ H264（answer 常用 PT 102）、音频 Opus（111），按 offer 实际可用�
 都按 SSRC 决定作用于哪一路。本仓库每个 source 分配 video_ssrc/audio_ssrc，见 `/rtc/v1/stats`。
 
 **RTP sequence number / timestamp / marker**：序号供排序与丢包检测（丢包 = 序号跳变）；时间戳为媒体采样
-时刻；marker（M 位）标记一帧的最后一个包。本仓库快照累积的「帧末判定」即读 M 位（`rtp[1] & 0x80`）。
+时刻；marker（M 位）标记一帧的最后一个包。本仓库 GOP 回放的「帧末判定」即读 M 位（`rtp[1] & 0x80`）。
 
 **FU-A（RFC 6184）**：单帧超过 MTU 时的分片封装，一个 NAL 拆成多个 RTP 包，头内 S/E 位标记首/末片。
 H.264 关键帧这类大帧几乎必然走 FU-A。
 
 **STAP-A（RFC 6184）**：把多个小 NAL（典型为 SPS+PPS）聚合进一个 RTP 包以省包头。本仓库以「收到
-STAP-A」作为关键帧 AU 起点（is_gop_start），触发快照重置（见第 4 节）。
+STAP-A」作为关键帧 AU 起点（is_gop_start），触发 GOP 起点前移（见第 4 节）。
 
 **RTCP（RFC 3550）**：与 RTP 同路的控制报文（PT 200~207），承载统计与反馈。播放场景中客户端正是靠
 RTCP 反馈让服务端获知下行质量。
@@ -357,7 +363,7 @@ RTCP 反馈让服务端获知下行质量。
 **RTCP NACK（RFC 4585，PT=205 FMT=1）**：接收端按序号逐包请求重传，属通用 RTP 反馈（RTPFB）。
 
 **RTCP PLI / FIR（RFC 4585）**：接收端「请给我新的可解码关键帧」请求，用于首帧或关键帧丢失后的恢复；
-PLI 不指定具体丢哪个包。本仓库收到 PLI 会回放最近关键帧快照。
+PLI 不指定具体丢哪个包。本仓库收到 PLI 会从 GOP 环回放最近一个关键帧 AU。
 
 **REMB（Google 草案，非标准）**：接收端把「下行带宽最多约 XX bps」反馈给发送端，与 TWCC 互补/被其演
 替。本仓库以 TWCC 为主。
@@ -414,10 +420,10 @@ SEI/AUD）。
 斜。本仓库每 2s 输出 `avsync vskew/askew/av`；漂移恒定（skew 稳定）即对齐良好。
 
 **GOP / 关键帧间隔**：相邻关键帧之间的帧组。间隔大则码率省，但首帧、随机跳转、丢包恢复都变慢。本仓库
-演示源 `-g 60`（30fps → 每 2s 一个 IDR）。
+演示源 `-g 30`（30fps → 每 1s 一个 IDR）。
 
 **gop_cache / 秒开**：订阅时先把最近关键帧发给新观众，使其立刻可解码而不必等下一个自然 IDR。HTTP-FLV
-模块自带 gop cache；本仓库 WebRTC 侧用关键帧快照回放实现同一目标（第 3~5 节）。
+模块自带 gop cache；本仓库 WebRTC 侧用 GOP 环回放关键帧 AU 实现同一目标（第 3~5 节）。
 
 **TTFF（time-to-first-frame，首帧耗时）**：点击播放到第一帧上屏的毫秒数，直播体验关键指标，由信令
 RTT + ICE 连通 + DTLS 握手 + 关键帧等待共同决定。
@@ -446,7 +452,7 @@ RTMP→WebRTC、RTMP→HTTP-FLV 均为直转。
 布到不同 worker，由此引出共享内存与跨 worker 话题。
 
 **共享内存 shm / ngx_slab**：master 预分配、所有 worker 共享的内存 zone（本仓库 `rtc_zone`），存放
-source/session 注册表、关键帧快照与媒体环。
+source/session 注册表、GOP 重传环与媒体环。
 
 **跨 worker 发布/订阅**：推流与播放落在不同 worker 时的媒体搬运。本仓库 WebRTC 用共享媒体环（生产者
 enqueue，归属 worker dequeue 后广播）打通；HTTP-FLV 靠模块自带的跨进程 relay（error.log 里
