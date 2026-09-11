@@ -227,7 +227,7 @@ flowchart LR
 
 HTTP 播放接口按 nginx 自定义模块规范创建 `ngx_command_t`、`ngx_http_module_t`、`ngx_module_t` 注册进 http 体系；UDP 服务同理走 stream 体系。
 
-代码分两层，靠 addon `config` 脚本决定编译归属。**纯 C 核心**（rtp / sdp / stun / dtls / srtp / audio / rtcp / core）不引用 nginx 头文件、无全局可变状态，输入输出全部经参数传入，加解密与封装的回调由调用者持有 scratch buffer，因此可以脱离 nginx 在 host 上单测；**nginx 胶水层**只做「事件 → 纯 C 调用 → socket 发送」的翻译，业务逻辑一律下沉。协议核心有 37 个 host 单测用例，覆盖 rtp/stun/sdp/rtcp/hsm/session_fsm，其中 B 帧识别的 Exp-Golomb 解析缺陷就是被单测断言拦下的。
+代码分两层，靠 addon `config` 脚本决定编译归属。**纯 C 核心**（rtp / sdp / stun / dtls / srtp / audio / rtcp / core）不引用 nginx 头文件、无全局可变状态，输入输出全部经参数传入，加解密与封装的回调由调用者持有 scratch buffer，因此可以脱离 nginx 在 host 上单测；**nginx 胶水层**只做「事件 → 纯 C 调用 → socket 发送」的翻译，业务逻辑一律下沉。host 单测用例现有 145 个，覆盖 rtp/stun/sdp/rtcp/jitter/hsm/session_fsm/ring/shm 等协议与胶水层，其中 B 帧识别的 Exp-Golomb 解析缺陷就是被单测断言拦下的。
 
 媒体热路径**没有引入协程和自建线程/队列**，全部跑在 nginx 单事件循环内：桥接（生产者）与 stream（消费者）同处一个地址空间，每个 session 挂 source 的订阅者队列上，RTP 到达时直接遍历订阅者逐个 SRTP 加密发送，回收交给 `ngx_event_timer` 周期 reap。这正是"在 nginx 框架内完成转换、不引入独立 RTC 服务"定位的直接结果。唯一的例外是 AAC→Opus 转码：FFmpeg 解码加 libopus 编码是 CPU 密集操作，同步跑在事件循环里会让多路推流互相挤压，因此每路转码放独立 pthread，nginx worker 只负责投递裸 AAC 帧、取回 Opus 帧，中间用有界环衔接。
 
@@ -312,7 +312,7 @@ sequenceDiagram
 
 ### 5.1 三个最容易踩的协议坑
 
-1. **session 不能用 request pool 分配**。session 生命周期跨越 HTTP 请求，返回 answer 之后还要在 UDP 侧完成 DTLS/SRTP。用 `r->pool` 会在响应返回后内存失效，后续 STUN 匹配读到垃圾。正确做法是 `ngx_alloc` 从进程堆分配，配合空闲 reap 定时器回收。
+1. **session 不能用 request pool 分配**。session 生命周期跨越 HTTP 请求，返回 answer 之后还要在 UDP 侧完成 DTLS/SRTP。用 `r->pool` 会在响应返回后内存失效，后续 STUN 匹配读到垃圾。正确做法是 `ngx_calloc` 从进程堆分配，配合空闲 reap 定时器回收。
 2. **DTLS server 要显式 `SSL_set_accept_state`**。OpenSSL 不会因为用了 `DTLS_server_method()` 就自动进入 accept 状态，漏掉这一步报 `ssl_read_internal:uninitialized`，握手无感知失败。
 3. **STUN username 的顺序不一定是 RFC 里那个**。UDP 侧要靠 ICE ufrag 从 username 里匹配 session，标准写法是 `client_ufrag:server_ufrag`，但实测 werift 发出来的是 `server_ufrag:client_ufrag`，前半是服务端 ufrag。取错一半，STUN 永远匹配不到 session，媒体零包且没有任何报错。
 
@@ -322,7 +322,7 @@ RTMP 推流是 TCP 可靠输入，播放端唯一能给出的反馈就是 RTCP�
 
 丢包恢复走发送侧 NACK：answer 声明 `a=rtcp-fb:102 nack` 与 `nack pli`，stream 模块解码 SRTCP，按 `media_ssrc` 过滤后从 ring 取包重传。两个容易忽略的点：音视频 seq 各自独立计数，重传缓存要么按媒体分环、要么按 ssrc+seq 双重匹配，否则会重传出错误流的数据；GOP 回放瞬间可突发上千包，socket 满时直接丢并计数，让客户端经 NACK/PLI 自行恢复，回放循环检测到发送失败即提前终止，避免冲击播放器的抖动缓冲区。
 
-TWCC / GCC / REMB 这类上行带宽估计在本场景不适用：单向播放没有上行媒体，服务端也没有可下调码率的编码器，明确不做。
+上行带宽估计在本场景不适用：没有 RTC 上行媒体，推流端也不受播放端反馈影响。但下行播放端仍会回传 TWCC 丢包反馈与 REMB 估计，服务端据此用 token bucket 自适应发送速率（TWCC 丢包驱动 AIMD，REMB 只作为上限），并不依赖编码器下调码率。
 
 ### 5.3 多 worker 与多分辨率
 

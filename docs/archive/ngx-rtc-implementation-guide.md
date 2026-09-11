@@ -86,10 +86,13 @@ flowchart LR
 | --- | --- | --- |
 | `rtp`（AVCC→NALU、RFC 6184 打包）、`sdp`、`stun`、`rtcp`、`hsm`/`session_fsm` | 否 | 是 |
 | `srtp`（libsrtp2 封装）、`dtls`（OpenSSL wrapper） | 否（链第三方库） | 是（真实库或 mock） |
-| `audio`（AAC→Opus）、`core`（source/session 注册表） | 部分（注册表用 ngx_rbtree/ngx_queue） | audio 是 / core 否 |
-| `ngx_rtmp_rtc_bridge_module`、`ngx_rtc_http_module`、`ngx_rtc_stream_module` | 是 | 否（薄胶水层） |
+| `audio`（AAC→Opus）、`ring`（定长环 + `ngx_rtc_vring_t` 变长字节环）、`jitter`（WHIP 上行重排）、`avsync`（SR→NTP 映射） | 否 | 是 |
+| `core`（source/session 注册表、pacer/TWCC）、`shm`（`rtc_zone` 注册表骨架、publish 所有权、重传环/媒体环） | 部分（`ngx_rtc_shm.c` 用 nginx 类型） | 是（`test_rtc_core`/`test_shm` 在 host 编译运行） |
+| `audio_worker`（转码 pthread，vring + mutex/cond） | pthread | 是（`test_audio_worker`） |
+| `ngx_rtc_core_module`（`rtc_zone` 指令与 core 模块定义，由 shm.c 拆出） | 是 | 否（仅 nginx 配置路径） |
+| `ngx_rtmp_rtc_bridge_module`、`ngx_rtc_http_module`、`ngx_rtc_stream_module` | 是 | 否（薄胶水层；`test_stream_module` 以 #include 覆盖静态 close/DTLS 回调） |
 
-原则：**逻辑下沉到纯 C 模块，nginx 侧只做事件/配置/socket 翻译**。纯 C 单测用 host CMake + TDD（RED→GREEN→REFACTOR），RFC 位级代码（STUN 长度边界、FU-A 位级、SDP 解析）必须有单测覆盖，端到端测试只数包不校验语义，不足以暴露这类缺陷。
+原则：**逻辑下沉到纯 C 模块，nginx 侧只做事件/配置/socket 翻译**。纯 C 单测用 `test/Makefile` + TDD（RED→GREEN→REFACTOR）：Linux 下 `NGX_SRC` 默认指向已 configure 的 openresty/nginx 源码树，生产 TU 直接用真实 nginx 头编译；`test/nginx_stub.c` 在真实头构建里只补 nginx 未链接的符号，无 nginx 头（Windows 交叉构建）时它才提供完整的桩对象。RFC 位级代码（STUN 长度边界、FU-A 位级、SDP 解析）必须有单测覆盖，端到端测试只数包不校验语义，不足以暴露这类缺陷。
 
 ---
 
@@ -150,7 +153,7 @@ SRS 参考：`SrsRtcRtpBuilder`（srs_app_rtc_source.cpp:830-1408）。
 2. **IDR 前拼 STAP-A（SPS+PPS）**：检测到 IDR 先发 type=24 的 STAP-A 包，装入缓存的 SPS/PPS（`package_stap_a`，srs_app_rtc_source.cpp:1174-1231）。
 3. **单 NALU 直接打包**（≤1200 字节）、**超长 NALU 切 FU-A**（type=28，首字节拆 FU indicator `28|(nri&~0x1F)` + FU header `type|S(0x80)|E(0x40)`，每片 1200 字节）。
 4. **RTP 头**：PT=协商值（见 3.6）、SSRC=源 SSRC、`timestamp = FLV毫秒 × 90`、seq 自增、**末分片 marker=1**。
-5. **常量**：`kRtpMaxPayloadSize=1200`（=1500−300）、NAL type mask `0x1F`，全部用固定宽度整型。
+5. **常量**：`NGX_RTC_H264_MTU=1200`（=1500−300，单包 = `NGX_RTC_MAX_RTP_PKT` 12+2+1200=1214）、NAL type mask `0x1F`，全部用固定宽度整型。
 
 ### 3.2 AAC → Opus 转码（`ngx_rtc_audio`）
 
@@ -170,7 +173,7 @@ SRS 参考：`SrsDtlsImpl`（srs_app_rtc_dtls.cpp:461-676）。
 2. **每会话内存 BIO**（非 socket BIO，nginx 事件模型不允许阻塞 IO）：`SSL_new` → `BIO_s_mem()` in/out → out BIO 挂 write 回调经 UDP 发出（必须用 callback 而非 `BIO_get_mem_data`，否则 MTU 分片处理不对）。
 3. **服务端必须显式 `SSL_set_accept_state(ssl)`**——OpenSSL 不会因 `DTLS_server_method()` 自动进入 accept 状态，漏掉报 `ssl_read_internal:uninitialized`，握手无感知失败。
 4. **角色由 SDP `a=setup` 决定**：offer 默认 `actpass` → answer 取 `passive`（server）；收包流程 `BIO_write(in) → SSL_read → SSL_is_init_finished()`。
-5. **密钥导出（RFC 5764 use_srtp，最核心的自写代码）**：握手完成后 `SSL_export_keying_material(dtls, material, 60, "EXTRACTOR-dtls_srtp", ...)`，前 30 字节 client key(16)+salt(14)、后 30 字节 server 的，按自身角色分配 recv/send。
+5. **密钥导出（RFC 5764 use_srtp，最核心的自写代码）**：握手完成后 `SSL_export_keying_material(dtls, material, 60, "EXTRACTOR-dtls_srtp", ...)`；60 字节布局是 `[client_key 16][server_key 16][client_salt 14][server_salt 14]`（不是前后各 30 字节连续），服务端 recv 取 client key+salt、send 取 server key+salt。
 6. **健壮性**：握手需要超时重传驱动（`DTLSv1_handle_timeout` + `ngx_add_timer`），不能只靠会话空闲回收兜底；首包可用 `DTLSv1_listen()` + HelloVerifyRequest cookie（HMAC-SHA1 绑定客户端地址）做无状态反欺骗——两者均来自 nginx 官方 2018 stream DTLS patch（未合并，见第 8 节）。
 
 ### 3.4 SRTP（`ngx_rtc_srtp`）
@@ -210,6 +213,7 @@ SRS 参考：`SrsGoApiRtcPlay`（srs_app_rtc_api.cpp:52-278）。
 2. **鉴权在 Lua access 阶段**（`access_by_lua_file` 做 stream key 校验 + `resty.limit.count` 限流），C 模块只做 content 阶段的 offer 解析与 answer 生成。
 3. **session 必须跨 request 存活**：返回 answer 后还要在 UDP 侧完成 DTLS/SRTP，session 对象用 `ngx_alloc` 从进程堆分配并挂全局注册表，**绝不能用 `r->pool`**（请求结束即销毁，后续 STUN 匹配读到垃圾内存）。
 4. body/sdp 缓冲要有明确上限并拒绝超限（静默截断会导致 JSON 解析失败变成难排查的 400）。
+5. **同一模块的控制与观测端点**：`rtc_kick`（`POST ?id=` 按 session id 请求关闭）、`rtc_disconnect`（按 `app/stream` 断开全部观看者）、`rtc_whip`（WHIP 推流信令）与 `rtc_play` 均为 `NGX_HTTP_LOC_CONF` 指令；`GET /rtc/v1/stats` 由 Lua 读 C 每 1 s 镜像进 `lua_shared_dict rtc_stats` 的快照（`rtc_stats` 是 dict 名，不是 C 指令），输出 `streams[].sessions[].state` 与顶层 `session_states` 聚合，`sessions[]` 含该源全部 session（未完成握手者与 WHIP 发布者也在内），`CLOSED` 不可观测。
 
 ---
 
@@ -270,22 +274,22 @@ sequenceDiagram
 | 机制 | SRS 实现参照 | 必要性 |
 | --- | --- | --- |
 | SRTCP 加解密 + RTCP 编解码（compound/NACK/PLI/RR/SR/BYE） | `srs_kernel_rtc_rtcp.cpp` | 必需（一切反馈的前提） |
-| NACK 下行重传（发送侧 ARQ + 源级 RTP 环形缓存） | `SrsRtcSendTrack::on_nack`（srs_app_rtc_source.cpp:2905-2950） | 必需（丢包 >3% 时无 NACK 画面迅速劣化） |
+| NACK 下行重传（发送侧 ARQ + 源级 RTP 环形缓存，进程内与 shm 两级） | `SrsRtcSendTrack::on_nack`（srs_app_rtc_source.cpp:2905-2950） | 必需（丢包 >3% 时无 NACK 画面迅速劣化） |
 | 首帧加速：GOP 缓存 + 订阅即发（替代 PLI） | IDR 前 STAP-A（已同款）；RTMP 场景须自建 GOP 缓存 | 必需（否则新观众等 2-5s 下一个 IDR） |
 | Session 生命周期 + 超时回收 | `SrsRtcConnection::is_alive` + `session_timeout` | 必需（资源正确性） |
 | Opus 封装（ts=dts×48、marker=1、一帧一包） | `package_opus`（srs_app_rtc_source.cpp:1033） | 必需（完整直播） |
 | 每订阅者重写 PT（`rebuild_packet` 思路） | `SrsRtcSendTrack::rebuild_packet`（srs_app_rtc_source.cpp:2785-2903） | 必需（异构浏览器 PT 不同，见 6.1） |
-| RR + NACK 间隔随 RTT 自适应 | `SrsRtpNackForReceiver::update_rtt` | 建议（弱网优化） |
-| TWCC / GCC / REMB | SRS 对本场景同样空实现/忽略 | **不做**（RTMP→RTC 单向播放，无上行媒体、服务器无编码器可调码率） |
+| NACK 响应窗口退避（饱和翻倍至 `NGX_RTC_NACK_WINDOW_MAX_MS`，静默复位） | 无（自研，替代 RTT 自适应） | 建议（弱网 NACK 风暴抑制） |
+| TWCC 反馈解析 + GCC-lite 丢包 AIMD（>5% ×0.85 / <2% +8%，500 ms 或 20 包窗口）、REMB 上限收缩、token-bucket pacer | SRS `on_rtcp_feedback_twcc` 空实现/忽略 | **已做**（发送侧 pacer 变速；无编码器可调码率，故只调发送速率） |
 | 音视频 NTP/RTP 同步（avsync） | `SrsRtcRecvTrack` | 不需要（下行音视频 ts 均源自同一 RTMP timestamp，天然同步） |
 
 **GOP 环形缓存设计要点**：
 
-- source 内**定长槽数组**缓存明文 RTP（一次缓存、N 订阅者回放/NACK 用），DTLS 完成订阅时先回放最近一个 GOP（自最新 IDR 的 STAP-A 起），无需等下一个 IDR。
+- source 内**定长槽数组**缓存明文 RTP（一次缓存、N 订阅者回放/NACK 用），DTLS 完成订阅时先回放最近一个 GOP（自最新 IDR 的 STAP-A 起），无需等下一个 IDR；跨 worker 另有每 source 一份的 shm 重传环（`ngx_rtc_shm_retransmit_t`）镜像，任意 worker 可回放/NACK。
 - **音视频分环或按 ssrc+seq 双重匹配**：音视频 seq 各自独立计数，混存一个 ring 时以最老槽 seq 为基准的差值定位基本失效，且不核对 `media_ssrc` 时可能重传出错误流的数据。
 - **NACK 只服务视频且按 `media_ssrc` 过滤**；fetch 时校验 seq 完全一致再重传（避免 SRTP 失败），重发走 `allow_repeat_tx=1`。
-- **回放需要 pacing**：GOP 回放一次可突发上千包，多观众同时加入时在单事件循环内串行突发会打爆客户端 jitter buffer，需要限速或提前终止。
-- 借鉴 RT-Thread `rt_ringbuffer` 的「mirror bit 空满判定」与「满覆盖最旧」语义即可，**不引入 DPDK rte_ring 的 CAS 无锁结构**（单 worker 事件循环内是单生产者 + 多只读消费者，无并发竞争），也不必套用 `ngx_buf_t` 引用计数（多 worker 前是多余负担）。
+- **回放只发关键帧访问单元**：`ngx_rtc_rtp_ring_replay` 从 `max(oldest, gop_start)` 同步回放到该 AU 的 marker 位即停，不重发整个 GOP；关键帧 AU 全程豁免 pacer，因此仍是突发，socket 满时按 `ngx_rtc_session_send_rtp` 返回值提前终止。
+- 借鉴 RT-Thread `rt_ringbuffer` 的「mirror bit 空满判定」与「满覆盖最旧」语义即可，**不引入 DPDK rte_ring 的 CAS 无锁结构**：进程内环仍是单生产者 + 多只读消费者无锁，跨 worker 走 shm 重传环并持 slab pool mutex；也不必套用 `ngx_buf_t` 引用计数。
 
 ---
 
@@ -303,13 +307,15 @@ sequenceDiagram
 
 1. **session/source 跨请求存活**：session 用 `ngx_alloc` + 显式回收（reap timer + close 释放）；source 要有 remove 路径（断流释放 ring/转码器/移出 rbtree），且断流重推要复位 seq/timestamp（否则 RTP 非单调，订阅者解码错乱）。
 2. **UDP 连接槽位**：session 关闭必须连带结束底层 nginx stream 会话（见 4.2-3）。
-3. **单 worker 下 source 用 `ngx_rbtree`（按 app/stream 名 O(log n) 查找）、session/订阅者用 `ngx_queue`**——按需取 nginx 既有数据结构，不自研。
+3. **进程内 source 用 `ngx_rbtree`（按 app/stream 名 O(log n) 查找）、session/订阅者用 `ngx_queue`；跨 worker 索引另在 `rtc_zone` 的 shm registry**——按需取 nginx 既有数据结构，不自研。
 
 ---
 
 ## 7. 多 worker 扩展
 
 **问题**：多 worker 下信令落在 worker A、UDP 落在 worker B 时，进程内注册表查不到 session（每个 worker 独立的 DTLS 证书还会导致 SDP fingerprint 与握手证书不一致）。
+
+**状态：已实现**——`rtc_zone` + `ngx_rtc_core_module`（`init_module` 预建 per-worker eventfd）+ `ngx_rtc_shm.c`（shm source/session 骨架、publish 所有权、per-worker 媒体环、publisher 心跳回收）；以下约束仍成立。
 
 **方案约束**：
 
