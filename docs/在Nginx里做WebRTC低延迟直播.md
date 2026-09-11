@@ -190,7 +190,7 @@ http {
     server {
         listen 18082;
         location /rtc/v1/play/ {
-            access_by_lua_file conf/auth.lua;  # stream key 校验 + 限流
+            access_by_lua_file conf/auth.lua;  # HMAC t/sign 校验 + 限流
             rtc_candidate_ip   172.16.48.122;  # answer 下发的 candidate
             rtc_candidate_port 8000;
             rtc_play;
@@ -227,7 +227,7 @@ flowchart LR
 
 HTTP 播放接口按 nginx 自定义模块规范创建 `ngx_command_t`、`ngx_http_module_t`、`ngx_module_t` 注册进 http 体系；UDP 服务同理走 stream 体系。
 
-代码分两层，靠 addon `config` 脚本决定编译归属。**纯 C 核心**（rtp / sdp / stun / dtls / srtp / audio / rtcp / core）不引用 nginx 头文件、无全局可变状态，输入输出全部经参数传入，加解密与封装的回调由调用者持有 scratch buffer，因此可以脱离 nginx 在 host 上单测；**nginx 胶水层**只做「事件 → 纯 C 调用 → socket 发送」的翻译，业务逻辑一律下沉。host 单测用例现有 145 个，覆盖 rtp/stun/sdp/rtcp/jitter/hsm/session_fsm/ring/shm 等协议与胶水层，其中 B 帧识别的 Exp-Golomb 解析缺陷就是被单测断言拦下的。
+代码分两层，靠 addon `config` 脚本决定编译归属。**纯 C 核心**（rtp / sdp / stun / dtls / srtp / audio / rtcp / core）不引用 nginx 头文件、无全局可变状态，输入输出全部经参数传入，加解密与封装的回调由调用者持有 scratch buffer，因此可以脱离 nginx 在 host 上单测；**nginx 胶水层**只做「事件 → 纯 C 调用 → socket 发送」的翻译，业务逻辑一律下沉。host 单测覆盖 rtp/stun/sdp/rtcp/jitter/hsm/session_fsm/ring/shm 等协议与胶水层，改动后以 `make -C test test` 的实测总数为准。
 
 媒体热路径**没有引入协程和自建线程/队列**，全部跑在 nginx 单事件循环内：桥接（生产者）与 stream（消费者）同处一个地址空间，每个 session 挂 source 的订阅者队列上，RTP 到达时直接遍历订阅者逐个 SRTP 加密发送，回收交给 `ngx_event_timer` 周期 reap。这正是"在 nginx 框架内完成转换、不引入独立 RTC 服务"定位的直接结果。唯一的例外是 AAC→Opus 转码：FFmpeg 解码加 libopus 编码是 CPU 密集操作，同步跑在事件循环里会让多路推流互相挤压，因此每路转码放独立 pthread，nginx worker 只负责投递裸 AAC 帧、取回 Opus 帧，中间用有界环衔接。
 
@@ -247,7 +247,7 @@ sequenceDiagram
 
     Note over H,U: RTC服务
     C->>H: POST /rtc/v1/play/（JSON: sdp + streamurl + key）
-    H->>H: Lua鉴权（stream key校验 + 限流）
+    H->>H: Lua 鉴权（HMAC t/sign 校验 + 限流）
     H->>H: 解析offer sdp，创建session<br/>（进程堆分配，跨request存活）
     H->>H: 分配SSRC/PT，生成answer sdp<br/>（含candidate + DTLS指纹）
     H->>C: 返回answer sdp（code:0）
@@ -303,7 +303,7 @@ sequenceDiagram
 | 首包延迟 | 约 560 ms（对比 RTMP/Http-Flv 1~3 s、HLS 10 s+） |
 | 视频链路 | H264 → RTP 761 包 / 362 KB，含 B 帧过滤与 FU-A 分片 |
 | 音频链路 | AAC → Opus 389 包 / 67 KB |
-| 信令鉴权 | 正确 stream key 返回 `code=0`，RTMP/HTTP-FLV/WebRTC 三路同源鉴权 |
+| 信令鉴权 | 有效 HMAC 令牌（`t`/`sign`）返回 `code=0`，RTMP/HTTP-FLV/WebRTC 三路同一套令牌 |
 | 兜底能力 | HTTP-FLV 分发保留，与 WebRTC 并行 |
 
 首包 560 ms 的构成未做逐段拆分；真实出图延迟以播放器首个 IDR 到达为准，多分辨率转码档实测 476~554 ms。

@@ -1,12 +1,7 @@
 # 部署侧编程规范(deploy/**/*.lua、scripts/*.sh、client/*.mjs)
 
 > 本仓没有 C 源码 —— `vendor/` 与 `build/src/` 里的都是独立仓 `nginx-rtc-module` 的副本。
-> **C 部分规范只在该仓 `docs/nginx-coding-standards.md`**,本文件不再同步一份。
->
-> 曾经同步过,结果是两份复制体各自漂移:本文件把 `ngx_event_recvmsg()` 的循环边界抄成了
-> `while (ev->available)`,而 nginx 源码写的是 `do { ... } while (ev->available)`
-> (`event/ngx_event_udp.c:67` 与 `:347`)。结论没受影响,但引用对不上源码,照着核会核不对。
-> 维护一份副本的成本,高于为此多读一个文件。
+> **C 部分规范只在模块仓 `nginx-rtc-module/docs/nginx-coding-standards.md`**,本文件不重复。
 
 ## 结论
 
@@ -60,6 +55,7 @@
 - 解析 RTP 分片时,续片没有前置起始片(丢包 / 中途接入)要丢弃,不要 `concat(nil, ...)` ——
   崩溃点恰好落在该工具要观测的丢包场景上(`client/dump.mjs` 的 FU-A 分支)。
 
-**未修,需单独决策**:HMAC secret 硬编码在三处可执行文件(`run.sh:34`、`play.mjs:6`、
-`dump.mjs:104`),且与 `deploy/nginx/conf/stream_keys.lua` 同值。去掉默认值会让 `./run.sh push` 与
-`client/play.mjs` 在没有外部注入时不可用,属于使用方式的改变。
+**未修,需单独决策**:HMAC secret 硬编码在可执行文件(`run.sh:34`、`client/lib/token.mjs` 的 `DEMO_KEY`),
+且与 `deploy/nginx/conf/stream_keys.lua` 同值。**签名算法本身已收敛到 `client/lib/token.mjs` 一处**
+(此前 play/dump/probe 各写一份,消息格式抄错一处就是 403);收敛的是算法与默认值,不是 secret 的存在。
+去掉默认值会让 `./run.sh push` 与 `client/play.mjs` 在没有外部注入时不可用,属于使用方式的改变。

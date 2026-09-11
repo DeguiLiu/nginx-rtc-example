@@ -159,7 +159,9 @@ function fallback(reason) {
 
 function fmtMs(sec) { return sec == null ? "—" : (sec * 1000).toFixed(1) + " ms"; }
 function fmtPct(x) { return x == null ? "—" : x.toFixed(1) + "%"; }
-function fmtKbps(bps) { return bps == null ? "—" : (bps / 1024).toFixed(1) + " kbps"; }
+// kbps 是千比特每秒：除数必须是 1000。用 1024 会把 pacer 上限 8000000 bps 显示成
+// 7812.5，而下限 64000 bps 显示成 62.5 —— 图例里"掉到 64 kbps"这个判据就永远对不上。
+function fmtKbps(bps) { return bps == null ? "—" : (bps / 1000).toFixed(1) + " kbps"; }
 function badgeCls(state) {
   if (!state || state === "new" || state === "checking" || state === "disconnected") return "warn";
   if (state === "connected" || state === "completed") return "ok";
@@ -271,7 +273,7 @@ async function play() {
     const res = await fetch(api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, clientip: host, t: String(tk.t), sign: tk.sign }),
+      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, t: String(tk.t), sign: tk.sign }),
     });
     const data = await res.json().catch(() => null);
     if (!data) {

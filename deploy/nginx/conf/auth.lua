@@ -57,7 +57,7 @@ if not app or not stream then
     return ngx.exit(400)
 end
 
-if not config.verify(app .. "/" .. stream, req.t, req.sign) then
+if not config.verify(app .. "/" .. stream, req.t, req.sign, "play") then
     ngx.log(ngx.ERR, "rtc_auth: TOKEN DENIED app=", app, " stream=", stream,
             " t=", tostring(req.t), " sign=", tostring(req.sign))
     return ngx.exit(403)

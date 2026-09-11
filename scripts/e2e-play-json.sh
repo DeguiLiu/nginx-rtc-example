@@ -40,15 +40,24 @@ if ! curl -fsS --max-time 2 "$STATS" >/dev/null 2>&1; then
     curl -fsS --max-time 2 "$STATS" >/dev/null 2>&1 || fail "nginx did not answer $STATS within 20s"
 fi
 
-KEY="$(python3 -c '
+key_for() {  # <purpose> -> the secret stream_keys.lua holds for it
+    python3 -c '
 import re, sys
 src = open(sys.argv[1]).read()
-m = re.search(r"\[\"%s\"\]\s*=\s*\"([^\"]+)\"" % re.escape(sys.argv[2]), src)
+m = re.search(r"\[\"%s\|%s\"\]\s*=\s*\"([^\"]+)\"" % (re.escape(sys.argv[2]), sys.argv[3]), src)
 print(m.group(1) if m else "")
-' "$BASE/deploy/nginx/conf/stream_keys.lua" "live/$STREAM" || true)"
-[ -n "$KEY" ] || fail "no stream key for live/$STREAM in stream_keys.lua"
+' "$BASE/deploy/nginx/conf/stream_keys.lua" "live/$STREAM" "$1" || true
+}
 
-sign_for() {  # app/stream -> "t=..&sign=.."
+# Publishing and playing use different secrets (deploy/nginx/conf/stream_keys.lua):
+# the play secret ships inside the player pages, so it must not authorize ingest.
+# This guard does both, so it needs both.
+PUB_KEY="$(key_for publish)"
+PLAY_KEY="$(key_for play)"
+[ -n "$PUB_KEY" ] || fail "no publish secret for live/$STREAM in stream_keys.lua"
+[ -n "$PLAY_KEY" ] || fail "no play secret for live/$STREAM in stream_keys.lua"
+
+sign_with() {  # <secret> -> "t=..&sign=.."
     python3 -c '
 import base64, hashlib, hmac, sys, time
 key, name = sys.argv[1], sys.argv[2]
@@ -57,14 +66,14 @@ sig = base64.urlsafe_b64encode(
     hmac.new(key.encode(), ("%s|t=%s" % (name, t)).encode(), hashlib.sha256
 ).digest()).decode().rstrip("=")
 print("t=%s&sign=%s" % (t, sig))
-' "$KEY" "live/$STREAM"
+' "$1" "live/$STREAM"
 }
 
 # --- 1. a live source, so the answer is a real one ------------------------
 # An RTMP publish only enters the cross-worker shm registry once something
 # creates the source, so "publishing" in /rtc/v1/stats is not a readiness
 # signal here. Keep the publisher up and let the play retry loop below decide.
-QS="$(sign_for)"
+QS="$(sign_with "$PUB_KEY")"
 PUSH_LOG="$(mktemp)"
 RESP="$(mktemp)"
 REQ="$(mktemp)"
@@ -87,7 +96,7 @@ LAST=""
 while [ "$ATTEMPT" -lt 10 ]; do
     ATTEMPT=$((ATTEMPT + 1))
 
-    python3 - "$STREAM" "$(sign_for)" >"$REQ" <<'PY'
+    python3 - "$STREAM" "$(sign_with "$PLAY_KEY")" >"$REQ" <<'PY'
 import json, sys
 stream, qs = sys.argv[1], sys.argv[2]
 t = dict(p.split("=", 1) for p in qs.split("&"))

@@ -31,7 +31,13 @@ fi
 
 NGX_CONF_SRC="$DEPLOY/conf/nginx.conf"
 NGX_CONF_RUN="$ORX/conf/nginx.rtc.conf"
-PUSH_KEY="${PUSH_KEY:-demo-secret-0123456789abcdef0123456789abcdef}"
+# Two credentials, matching stream_keys.lua's per-purpose secrets. PUSH_KEY is
+# the ingest side (RTMP on_publish, WHIP) and is server-only; PLAY_KEY is what
+# the player pages ship and what the ladder's pull, the FLV fallback and
+# /rtc/v1/play/ verify against. They must differ -- one shared secret made every
+# viewer a potential publisher.
+PUSH_KEY="${PUSH_KEY:-push-secret-9f8e7d6c5b4a39281706f5e4d3c2b1a0}"
+PLAY_KEY="${PLAY_KEY:-demo-secret-0123456789abcdef0123456789abcdef}"
 KEEP_PID=/tmp/rtc_keep_push.pid   # pid of keep-push supervisor, for stop()
 KEEP_TC_PID=/tmp/rtc_keep_tc.pid  # pid of keep-transcode supervisor, for stop()
 
@@ -41,9 +47,11 @@ KEEP_TC_PID=/tmp/rtc_keep_tc.pid  # pid of keep-transcode supervisor, for stop()
 # Format: name:width:height:fps:kbps
 RES_LADDER="${RES_LADDER:-1080p:1920:1080:30:4000 720p:1280:720:30:2000 540p:960:540:30:1000 360p:640:360:30:600}"
 
-sign_for() {  # app/stream expiry -> base64url HMAC signature
-    local msg="$1" exp="$2"
-    printf '%s' "$msg|t=${exp}" | openssl dgst -sha256 -hmac "$PUSH_KEY" -binary \
+sign_for() {  # app/stream expiry [key] -> base64url HMAC signature
+    # Defaults to the publish secret because every caller that signs for a URL
+    # ffmpeg acts on is pushing; the one pull passes PLAY_KEY explicitly.
+    local msg="$1" exp="$2" key="${3:-$PUSH_KEY}"
+    printf '%s' "$msg|t=${exp}" | openssl dgst -sha256 -hmac "$key" -binary \
         | base64 | tr '+/' '-_' | tr -d '='
 }
 
@@ -150,7 +158,7 @@ start_push() {
 start_transcode() {
     local exp sign
     exp=$(( $(date +%s) + 3600 ))
-    sign=$(sign_for "live/livestream" "$exp")
+    sign=$(sign_for "live/livestream" "$exp" "$PLAY_KEY")
     local src_url="rtmp://127.0.0.1:1935/live/livestream?t=${exp}&sign=${sign}"
 
     local args=(-i "$src_url" -loglevel warning)
@@ -338,9 +346,9 @@ case "${1:-}" in
     keep-push) keep_push ;;
     keep-transcode) keep_transcode ;;
     stop)    stop ;;
-    verify)  node "$BASE/client/play.mjs" ;;
+    verify)  shift; node "$BASE/client/play.mjs" "$@" ;;
     ngxtop)  shift; ngxtop "$@" ;;
     *)
-        echo "用法: $0 {sync|nginx|start|push|transcode|keep-push|keep-transcode|stop|verify|ngxtop}"
+        echo "用法: $0 {sync|nginx|start|push|transcode|keep-push|keep-transcode|stop|verify [play.mjs 参数]|ngxtop [参数]}"
         exit 1 ;;
 esac

@@ -1,13 +1,19 @@
 // dump.mjs - connect with werift, reassemble the H264 RTP payload into an
 // Annex-B .h264 file so ffprobe/ffplay can verify the bitstream is intact.
 import { RTCPeerConnection, useH264, useOPUS } from "werift";
-import { createHmac } from "node:crypto";
 import { openSync, writeSync, closeSync } from "node:fs";
+
+import { DEMO_KEY, signToken, streamPathOf } from "./lib/token.mjs";
 
 const API = "http://127.0.0.1:18082/rtc/v1/play/";
 const STREAM = process.argv[2] || "webrtc://127.0.0.1:18082/live/livestream";
-const STREAM_PATH = STREAM.replace(/^rtc:\/\/|^webrtc:\/\//, "").replace(/^[^/]+\//, "");
 const OUT = process.argv[3] || "/tmp/dump.h264";
+
+/* Same rule as client/play.mjs, and for the same reason: the server replays its
+ * cached GOP the moment SRTP becomes ready, so the first packets after connect
+ * are a deliberately discontinuous burst. Counting it made this tool report
+ * "missing: 23021" for a 6 s capture of 1819 packets on a link that lost none. */
+const WARMUP_MS = 1000;
 
 // stdout via writeSync: console.log is asynchronous when stdout is a pipe, so
 // a following process.exit() would truncate the summary. play.mjs does the same.
@@ -79,15 +85,46 @@ async function main() {
   let lastSeq = null;
   let seqGaps = 0;
   let seqDups = 0;
+  /* Three counters for the same quantity, exactly as client/play.mjs does it.
+   * gapPkts is the whole-window total and exists so the two windowed numbers
+   * can be audited against it: gapPkts === gapPost + gapWarmup holds by
+   * construction, so the warm-up can never hide a gap that --warmup 0 in
+   * play.mjs would have shown. */
   let gapPkts = 0;
+  let gapPost = 0;
+  let gapWarmup = 0;
+  let firstAt = 0;
+  let warmupUntil = 0;
   pc.onTrack.subscribe((track) => {
     if (track.kind !== "video") return;
     track.onReceiveRtp.subscribe((rtp) => {
+      const now = Date.now();
+      if (0 === firstAt) {
+        firstAt = now;
+        warmupUntil = now + WARMUP_MS;
+      }
       videoPkts++;
+      const inWarmup = 0 !== warmupUntil && now < warmupUntil;
+      if (0 !== warmupUntil && !inWarmup) {
+        /* First packet past the boundary: realign rather than charge the gap
+         * between the replay burst and the live stream, and skip this packet's
+         * own delta so a straddling gap lands in none of the counters. */
+        warmupUntil = 0;
+        lastSeq = null;
+      }
       if (lastSeq !== null) {
         const d = (rtp.header.sequenceNumber - lastSeq + 0x10000) & 0xffff;
-        if (d === 0) seqDups++;
-        else if (d > 1 && d < 0x8000) { seqGaps++; gapPkts += d - 1; }
+        if (d === 0) {
+          seqDups++;
+        } else if (d > 1 && d < 0x8000) {
+          seqGaps++;
+          gapPkts += d - 1;
+          if (inWarmup) {
+            gapWarmup += d - 1;
+          } else {
+            gapPost += d - 1;
+          }
+        }
       }
       lastSeq = rtp.header.sequenceNumber;
       if (rtp.payload && rtp.payload.length) handlePayload(rtp.payload);
@@ -100,19 +137,15 @@ async function main() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // HMAC token: t = expiry (unix s), sign = base64url(HMAC-SHA256(app/stream|t=t)).
-    const KEY = "demo-secret-0123456789abcdef0123456789abcdef";
-    const t = Math.floor(Date.now() / 1000) + 3600;
-    const sign = createHmac("sha256", KEY)
-      .update(`${STREAM_PATH}|t=${t}`)
-      .digest("base64url");
+    // HMAC token over the stream path; see client/lib/token.mjs.
+    const { t, sign } = signToken(DEMO_KEY, streamPathOf(STREAM));
 
     const res = await fetch(API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         sdp: offer.sdp, streamurl: STREAM, api: "http://127.0.0.1:18082",
-        clientip: "127.0.0.1", t: String(t), sign,
+        t: String(t), sign,
       }),
     });
     if (!res.ok) {
@@ -135,7 +168,10 @@ async function main() {
     closeSync(fd);
   }
 
-  out(`video packets: ${videoPkts} seqGaps: ${seqGaps} missing: ${gapPkts} dups: ${seqDups} -> ${OUT}\n`);
+  out(
+    `video packets: ${videoPkts} seqGaps: ${seqGaps} missing: ${gapPost} ` +
+      `warmup_missing: ${gapWarmup} missing_all: ${gapPkts} dups: ${seqDups} -> ${OUT}\n`
+  );
 }
 
 main().catch((e) => {

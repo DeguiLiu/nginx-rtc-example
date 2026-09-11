@@ -37,9 +37,21 @@ function _M.reload()
     return true
 end
 
+-- Purpose scoping. play and publish are different secrets (see stream_keys.lua),
+-- so a token minted for one role fails verification for the other. A table
+-- lookup rather than string concatenation on purpose: an unknown purpose is
+-- rejected instead of being interpolated into a key nobody defined.
+local SUFFIX = { play = "|play", publish = "|publish" }
+
 -- HMAC token 校验: secret 存 shared dict, t=过期 unix 秒, sign=base64url(HMAC-SHA256).
-function _M.verify(appstream, t, sign)
-    local secret = shared:get(appstream)
+-- purpose 缺省为 "play" —— 观看是最常见的调用方, 而推流必须显式声明, 免得新
+-- 加的 ingest 路径忘记传参就静默拿到观看侧权限。
+function _M.verify(appstream, t, sign, purpose)
+    local suffix = SUFFIX[purpose or "play"]
+    if not suffix then
+        return false
+    end
+    local secret = shared:get(appstream .. suffix)
     if not secret or "string" ~= type(secret) then
         return false
     end
@@ -58,12 +70,20 @@ function _M.list()
     return shared:get_keys(0)
 end
 
-function _M.set(appstream, key)
-    return shared:set(appstream, key)
+function _M.set(appstream, purpose, key)
+    local suffix = SUFFIX[purpose]
+    if not suffix then
+        return nil, "purpose must be play or publish"
+    end
+    return shared:set(appstream .. suffix, key)
 end
 
-function _M.del(appstream)
-    return shared:delete(appstream)
+function _M.del(appstream, purpose)
+    local suffix = SUFFIX[purpose]
+    if not suffix then
+        return nil, "purpose must be play or publish"
+    end
+    return shared:delete(appstream .. suffix)
 end
 
 return _M

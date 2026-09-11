@@ -33,12 +33,16 @@
  */
 
 import { RTCPeerConnection, useH264, useOPUS } from "werift";
+/* createHmac stays imported for the STUN MESSAGE-INTEGRITY below, which is
+ * HMAC-SHA1 over the datagram and has nothing to do with the playback token. */
 import { createHmac, randomBytes } from "node:crypto";
 import dgram from "node:dgram";
 import process from "node:process";
 
+import { DEMO_KEY, signToken, streamPathOf } from "./lib/token.mjs";
+
 const DEFAULT_STREAM = "webrtc://127.0.0.1:18082/live/livestream";
-const DEFAULT_KEY = "demo-secret-0123456789abcdef0123456789abcdef";
+const DEFAULT_KEY = DEMO_KEY;
 const DEFAULT_API = "http://127.0.0.1:18082";
 const DEFAULT_UDP = "127.0.0.1:8000";
 
@@ -67,7 +71,15 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    const take = () => argv[++i];
+    /* Guarded: `argv[++i]` alone yields undefined when the flag is last, which
+     * then reaches HMAC as the string "undefined" and fails as a 403 with no
+     * hint that the argument was simply missing. */
+    const take = () => {
+      if (i + 1 >= argv.length) {
+        throw new Error(`missing value for ${a}`);
+      }
+      return argv[++i];
+    };
     switch (a) {
       case "--stream": opts.stream = take(); break;
       case "--key": opts.key = take(); break;
@@ -155,9 +167,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const log = (...a) => { if (!opts.quiet) console.log(...a); };
 
-  const m = opts.stream.match(/^webrtc:\/\/[^/]+\/([^/]+)\/([^/]+)$/);
-  const app = m ? m[1] : "live";
-  const stream = m ? m[2] : "livestream";
+  const streamPath = streamPathOf(opts.stream);
 
   /* --- 1. signaling: get a session created and learn the server's ICE creds --- */
 
@@ -170,10 +180,7 @@ async function main() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  const t = Math.floor(Date.now() / 1000) + 3600;
-  const sign = createHmac("sha256", opts.key)
-    .update(`${app}/${stream}|t=${t}`)
-    .digest("base64url");
+  const { t, sign } = signToken(opts.key, streamPath);
 
   const res = await fetch(`${opts.api}/rtc/v1/play/`, {
     method: "POST",
@@ -182,7 +189,6 @@ async function main() {
       sdp: offer.sdp,
       streamurl: opts.stream,
       api: opts.api,
-      clientip: "127.0.0.1",
       t: String(t),
       sign,
     }),

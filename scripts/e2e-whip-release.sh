@@ -80,6 +80,34 @@ done
 [ -n "$STREAM" ] || fail "no free stream among: ${CANDIDATES[*]}"
 echo "[setup] using live/$STREAM"
 
+# --- 1b. this stream's ingest token --------------------------------------
+# Ingests authenticate with the publish secret, which is a different secret from
+# the one the player pages carry (deploy/nginx/conf/stream_keys.lua). Both WHIP
+# and RTMP below push, so both use this one token: sign =
+# base64url(HMAC-SHA256(publish_secret, "<app>/<stream>|t=<t>")).
+secret_for() {  # <appstream> <purpose> -> secret from stream_keys.lua
+    python3 -c '
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"\[\"%s\|%s\"\]\s*=\s*\"([^\"]+)\"" % (re.escape(sys.argv[2]), sys.argv[3]), src)
+print(m.group(1) if m else "")
+' "$BASE/deploy/nginx/conf/stream_keys.lua" "$1" "$2" || true
+}
+
+PUB_KEY="$(secret_for "live/$STREAM" publish)"
+[ -n "$PUB_KEY" ] || fail "no publish secret for live/$STREAM in stream_keys.lua"
+
+QS="$(python3 -c '
+import base64, hashlib, hmac, sys, time
+key, name = sys.argv[1], sys.argv[2]
+t = str(int(time.time()) + 300)
+sig = base64.urlsafe_b64encode(
+    hmac.new(key.encode(), ("%s|t=%s" % (name, t)).encode(), hashlib.sha256
+).digest()).decode().rstrip("=")
+print("t=%s&sign=%s" % (t, sig))
+' "$PUB_KEY" "live/$STREAM" || true)"
+[ -n "$QS" ] || fail "could not build the ingest token for live/$STREAM"
+
 # --- 2. one short WHIP publish, then let the client go away ---------------
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
@@ -87,8 +115,12 @@ trap 'rm -f "$LOG"' EXIT
 # request used to block this guard forever (and any CI job that runs it).
 # `|| RC=$?` keeps `set -e` from aborting before the 409 check below can explain
 # the failure.
+#
+# WHIP_STREAM carries the token because whip_push.mjs splices WHIP_STREAM into
+# the endpoint URL verbatim -- APPENDING it here is what lets the client satisfy
+# the new access_by_lua_file without that file needing to know about tokens.
 RC=0
-WHIP_STREAM="$STREAM" WHIP_DURATION=5000 \
+WHIP_STREAM="$STREAM&$QS" WHIP_DURATION=5000 \
     timeout $((READY_TIMEOUT_S + SLACK_S)) node "$BASE/client/whip_push.mjs" \
     >"$LOG" 2>&1 || RC=$?
 [ "$RC" != 124 ] || { cat "$LOG"; fail "whip_push hung: no exit within $((READY_TIMEOUT_S + SLACK_S))s"; }
@@ -118,27 +150,8 @@ done
 echo "[release] publishing cleared after ${RELEASED}s"
 
 # --- 4. the freed name must accept a different protocol --------------------
-# RTMP publish is HMAC-gated (deploy/nginx/conf/rtmp_auth.lua), so sign the same
-# way a real publisher does: sign = base64url(HMAC-SHA256(key, "app/stream|t=t")).
-KEY="$(python3 -c '
-import re, sys
-src = open(sys.argv[1]).read()
-m = re.search(r"\[\"%s\"\]\s*=\s*\"([^\"]+)\"" % re.escape(sys.argv[2]), src)
-print(m.group(1) if m else "")
-' "$BASE/deploy/nginx/conf/stream_keys.lua" "live/$STREAM" || true)"
-[ -n "$KEY" ] || fail "no stream key for live/$STREAM in stream_keys.lua"
-
-QS="$(python3 -c '
-import base64, hashlib, hmac, sys, time
-key, name = sys.argv[1], sys.argv[2]
-t = str(int(time.time()) + 300)
-sig = base64.urlsafe_b64encode(
-    hmac.new(key.encode(), ("%s|t=%s" % (name, t)).encode(), hashlib.sha256
-).digest()).decode().rstrip("=")
-print("t=%s&sign=%s" % (t, sig))
-' "$KEY" "live/$STREAM" || true)"
-[ -n "$QS" ] || fail "could not build the RTMP token for live/$STREAM"
-
+# Same token as the WHIP push above: one ingest credential per stream, whichever
+# transport carries it.
 T1="$(date +%s)"
 # `|| RTMP_RC=$?`: a rejected announce is one of the outcomes under test, so it
 # must reach the diagnostic below rather than abort the script via `set -e`.
