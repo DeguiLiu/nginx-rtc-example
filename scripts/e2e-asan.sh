@@ -212,7 +212,20 @@ run_step "RTMP push + webrtc play" bash -c '
 '
 
 # WHIP ingest: DTLS handshake, SRTP keying, session creation in the glue layer.
-run_step "WHIP publish" env WHIP_STREAM=whiptest WHIP_DURATION=6000 \
+# WHIP now requires an ingest token, and whip_push.mjs splices WHIP_STREAM into
+# the endpoint URL verbatim, so the query rides along with the stream name --
+# see conf/whip_auth.lua.
+run_step "WHIP publish" env WHIP_STREAM="whiptest&$(python3 -c '
+import base64, hashlib, hmac, re, sys, time
+src = open(sys.argv[1]).read()
+m = re.search(r"\[\"live/whiptest\|publish\"\]\s*=\s*\"([^\"]+)\"", src)
+key = m.group(1) if m else ""
+t = str(int(time.time()) + 300)
+sig = base64.urlsafe_b64encode(
+    hmac.new(key.encode(), ("live/whiptest|t=%s" % t).encode(), hashlib.sha256
+).digest()).decode().rstrip("=")
+print("t=%s&sign=%s" % (t, sig))
+' "$BASE/deploy/nginx/conf/stream_keys.lua")" WHIP_DURATION=6000 \
     node "$BASE/client/whip_push.mjs"
 
 # Publish-ownership arbitration (the regression guard from the FSM review).

@@ -10,7 +10,7 @@
 //
 // The default secret stays (DEMO_KEY), it is not removed: ./run.sh push and
 // client/play.mjs must work with no external injection. See the open decision
-// recorded in docs/nginx-coding-standards.md.
+// recorded in docs/deploy-coding-standards.md.
 
 import { createHmac } from "node:crypto";
 

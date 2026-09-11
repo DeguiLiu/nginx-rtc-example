@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { writeSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 
@@ -74,13 +75,51 @@ function createOpusTrack() {
   return { track, timer };
 }
 
-/* H264 Annex-B parser + RFC 6184 packer, fed from a live ffmpeg pipe. */
-function createH264Track() {
-  const track = new MediaStreamTrack({ kind: "video" });
+/* H.264 access-unit boundary rules (ISO/IEC 14496-10 7.4.1.2.4).
+ *
+ * A chunk from the ffmpeg pipe is not frame-aligned: one picture can arrive in
+ * two reads, and one read can carry the tail of one picture plus the head of
+ * the next. Doing the RTP work per chunk therefore stamps repeated or skipped
+ * timestamps, marks a picture boundary that is not there, and -- because the
+ * SPS/PPS pair was only emitted when both landed in the same read -- silently
+ * drops the parameter sets whenever a chunk boundary falls between them. The
+ * receiver's decoder, A/V sync and jitter accounting are all built on what
+ * this function emits, so the NALs have to be grouped into access units here.
+ *
+ * A picture starts at the first slice NAL (type 1 or 5) whose first_mb_in_slice
+ * is 0 -- the rule a decoder itself uses -- or at an access unit delimiter.
+ * first_mb_in_slice is the first ue(v) of the slice header, and ue(v) == 0 is
+ * coded as a single "1" bit, so the test is just "is the top bit of nal[1]
+ * set": no slice header parse is needed.
+ */
+const NAL_SLICE = 1;
+const NAL_IDR = 5;
+const NAL_SPS = 7;
+const NAL_PPS = 8;
+const NAL_AUD = 9;
+
+const nalType = (nal) => nal[0] & 0x1f;
+const isVcl = (type) => type === NAL_SLICE || type === NAL_IDR;
+const startsPicture = (nal) => nal.length >= 2 && (nal[1] & 0x80) !== 0;
+
+/*
+ * Feed Annex-B bytes in, get RTP packets out: one timestamp per access unit,
+ * and the marker bit on that unit's last packet. `track` is anything with
+ * writeRtp(pkt) -- a werift MediaStreamTrack in the client, a recorder in
+ * ausplit.mjs.
+ */
+export function createH264Packer(track, { payloadType = H264_PT, ssrc = 0x2a2b3c00 } = {}) {
   let sequenceNumber = 0x1000;
   let timestamp = 0;
-  const ssrc = 0x2a2b3c00;
   let annexB = Buffer.alloc(0);
+
+  /* Access unit under assembly. `prefix` holds the parameter sets and SEIs
+   * seen since the previous picture ended: they apply to the picture that
+   * follows them, not to the one that just ended. */
+  let auNals = [];
+  let auTs = 0;
+  let auHasPicture = false;
+  let prefix = [];
 
   const findStartCode = (buf, from) => {
     for (let i = from; i < buf.length - 3; i++) {
@@ -95,15 +134,37 @@ function createH264Track() {
   const startCodeLen = (buf, idx) =>
     buf[idx + 2] === 1 ? 3 : 4;
 
-  const sendRtp = (nalu, marker) => {
+  /* Split the buffered bytes into NALs. A NAL is only known to be complete
+   * once the next start code shows up, so mid-stream the tail is kept for the
+   * next chunk; at end of stream it is the last NAL and has to come out. */
+  const scanNals = (atEof) => {
+    const pending = [];
+    let idx = 0;
+    for (;;) {
+      const start = findStartCode(annexB, idx);
+      if (start < 0) break;
+      if (start > idx) {
+        pending.push(annexB.subarray(idx, start));
+      }
+      idx = start + startCodeLen(annexB, start);
+    }
+    if (atEof && idx < annexB.length) {
+      pending.push(annexB.subarray(idx));
+      idx = annexB.length;
+    }
+    annexB = annexB.subarray(idx);
+    return pending;
+  };
+
+  const sendRtp = (nalu, ts, marker) => {
     if (nalu.length <= MAX_RTP_PAYLOAD) {
       track.writeRtp(
         new RtpPacket(
           new RtpHeader({
             version: 2,
-            payloadType: H264_PT,
+            payloadType,
             sequenceNumber,
-            timestamp,
+            timestamp: ts,
             ssrc,
             marker,
           }),
@@ -130,9 +191,9 @@ function createH264Track() {
         new RtpPacket(
           new RtpHeader({
             version: 2,
-            payloadType: H264_PT,
+            payloadType,
             sequenceNumber,
-            timestamp,
+            timestamp: ts,
             ssrc,
             marker: end && marker,
           }),
@@ -144,49 +205,106 @@ function createH264Track() {
     }
   };
 
-  const emitStapA = (nals) => {
+  /* The marker bit never lands on a STAP-A: a picture always has at least one
+   * slice NAL after its parameter sets. */
+  const emitStapA = (nals, ts) => {
     const chunks = [Buffer.from([0x78])];
     for (const n of nals) {
       chunks.push(Buffer.from([(n.length >> 8) & 0xff, n.length & 0xff]));
       chunks.push(n);
     }
-    sendRtp(Buffer.concat(chunks), false);
+    sendRtp(Buffer.concat(chunks), ts, false);
   };
 
-  const onData = (chunk) => {
-    annexB = Buffer.concat([annexB, chunk]);
+  /* Open an access unit, seeding it with the parameter sets held over from the
+   * previous picture, and give it the next timestamp. */
+  const startAu = () => {
+    auNals = prefix;
+    prefix = [];
+    auHasPicture = false;
+    auTs = timestamp;
+    timestamp = (timestamp + H264_CLOCK / VIDEO_FPS) >>> 0;
+  };
 
-    let idx = 0;
-    const pending = [];
-    for (;;) {
-      const start = findStartCode(annexB, idx);
-      if (start < 0) break;
-      if (start > idx) {
-        pending.push(annexB.subarray(idx, start));
+  const flushAu = () => {
+    if (auNals.length === 0) {
+      return;
+    }
+
+    let i = 0;
+
+    /* An access unit delimiter, when the encoder emits one, is its own NAL. */
+    if (nalType(auNals[0]) === NAL_AUD) {
+      sendRtp(auNals[0], auTs, false);
+      i = 1;
+    }
+
+    /* Leading SPS/PPS travel together as one STAP-A (RFC 6184 5.8). */
+    const params = [];
+    while (i < auNals.length) {
+      const type = nalType(auNals[i]);
+      if (type !== NAL_SPS && type !== NAL_PPS) {
+        break;
       }
-      idx = start + startCodeLen(annexB, start);
+      params.push(auNals[i]);
+      i++;
     }
-    annexB = annexB.subarray(idx);
-
-    const sps = [];
-    const pps = [];
-    const frames = [];
-    for (const nal of pending) {
-      const type = nal[0] & 0x1f;
-      if (type === 7) sps.push(nal);
-      else if (type === 8) pps.push(nal);
-      else frames.push(nal);
+    if (params.length > 0) {
+      emitStapA(params, auTs);
     }
 
-    if (sps.length > 0 && pps.length > 0) {
-      emitStapA([...sps, ...pps]);
-    }
-    for (let i = 0; i < frames.length; i++) {
-      sendRtp(frames[i], i === frames.length - 1);
+    for (; i < auNals.length; i++) {
+      sendRtp(auNals[i], auTs, i === auNals.length - 1);
     }
 
-    timestamp = (timestamp + (H264_CLOCK / VIDEO_FPS)) >>> 0;
+    auNals = [];
+    auHasPicture = false;
   };
+
+  const pushNal = (nal) => {
+    const type = nalType(nal);
+
+    if (isVcl(type)) {
+      if (startsPicture(nal)) {
+        flushAu();
+        if (!auHasPicture) {
+          startAu();
+        }
+      }
+      auNals.push(nal);
+      auHasPicture = true;
+      return;
+    }
+
+    /* SPS / PPS / SEI / AUD: belongs to the picture that follows it. */
+    prefix.push(nal);
+  };
+
+  return {
+    push(chunk) {
+      annexB = Buffer.concat([annexB, chunk]);
+      for (const nal of scanNals(false)) {
+        pushNal(nal);
+      }
+    },
+
+    /* Send the access unit still in flight. Nothing in the stream says the
+     * last NAL read is the last NAL of its picture, so it is held until the
+     * next picture starts -- one frame of latency, as in any RTP packetizer.
+     * Call this at end of stream, or that picture is never sent. */
+    flush() {
+      for (const nal of scanNals(true)) {
+        pushNal(nal);
+      }
+      flushAu();
+    },
+  };
+}
+
+/* H264 Annex-B parser + RFC 6184 packer, fed from a live ffmpeg pipe. */
+function createH264Track() {
+  const track = new MediaStreamTrack({ kind: "video" });
+  const packer = createH264Packer(track);
 
   const ffmpeg = spawn("ffmpeg", [
     "-re",
@@ -202,7 +320,8 @@ function createH264Track() {
     "-",
   ]);
 
-  ffmpeg.stdout.on("data", onData);
+  ffmpeg.stdout.on("data", (chunk) => packer.push(chunk));
+  ffmpeg.stdout.on("end", () => packer.flush());
   ffmpeg.stderr.on("data", () => {});
   ffmpeg.on("error", (err) => log(`[ffmpeg] ${err.message}`));
   ffmpeg.on("exit", () => log("[ffmpeg] exited"));
@@ -270,7 +389,11 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  log(`[FAIL] ${err.message}`);
-  process.exit(1);
-});
+/* Importing this module -- ausplit.mjs, or any future unit test -- must not
+ * start a push. */
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    log(`[FAIL] ${err.message}`);
+    process.exit(1);
+  });
+}

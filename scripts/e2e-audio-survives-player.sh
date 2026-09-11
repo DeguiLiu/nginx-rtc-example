@@ -59,15 +59,24 @@ if ! curl -fsS --max-time 2 "$STATS" >/dev/null 2>&1; then
     curl -fsS --max-time 2 "$STATS" >/dev/null 2>&1 || fail "nginx did not answer $STATS within 20s"
 fi
 
-KEY="$(python3 -c '
+key_for() {  # <purpose> -> the secret stream_keys.lua holds for it
+    python3 -c '
 import re, sys
 src = open(sys.argv[1]).read()
-m = re.search(r"\[\"%s\"\]\s*=\s*\"([^\"]+)\"" % re.escape(sys.argv[2]), src)
+m = re.search(r"\[\"%s\|%s\"\]\s*=\s*\"([^\"]+)\"" % (re.escape(sys.argv[2]), sys.argv[3]), src)
 print(m.group(1) if m else "")
-' "$BASE/deploy/nginx/conf/stream_keys.lua" "live/$STREAM" || true)"
-[ -n "$KEY" ] || fail "no stream key for live/$STREAM in stream_keys.lua"
+' "$BASE/deploy/nginx/conf/stream_keys.lua" "live/$STREAM" "$1" || true
+}
 
-sign_for() {  # app/stream -> "t=..&sign=.."
+# Two credentials, because play and publish are different secrets: the play one
+# ships inside the player pages, the ingest one never leaves the server. This
+# script does both, so it needs both.
+KEY="$(key_for play)"
+PUB_KEY="$(key_for publish)"
+[ -n "$KEY" ] || fail "no play secret for live/$STREAM in stream_keys.lua"
+[ -n "$PUB_KEY" ] || fail "no publish secret for live/$STREAM in stream_keys.lua"
+
+sign_with() {  # <secret> <app/stream> -> "t=..&sign=.."
     python3 -c '
 import base64, hashlib, hmac, sys, time
 key, name = sys.argv[1], sys.argv[2]
@@ -76,7 +85,7 @@ sig = base64.urlsafe_b64encode(
     hmac.new(key.encode(), ("%s|t=%s" % (name, t)).encode(), hashlib.sha256
 ).digest()).decode().rstrip("=")
 print("t=%s&sign=%s" % (t, sig))
-' "$KEY" "live/$STREAM"
+' "$1" "$2"
 }
 
 # play_once <label> -> echoes the audio packet count, or fails.
@@ -100,7 +109,7 @@ except Exception:
     echo "$pkts"
 }
 
-QS="$(sign_for)"
+QS="$(sign_with "$PUB_KEY" "live/$STREAM")"
 PUSH_LOG="$(mktemp)"
 PUSH_PID=""
 # shellcheck disable=SC2064  # expand PUSH_PID now: it is assigned below
@@ -128,7 +137,7 @@ echo "  baseline: audio packets = $BEFORE"
 # --- 3. an RTMP player joins and leaves -----------------------------------
 # This is the action under test. -t 2 makes it disconnect while the publisher
 # carries on; -f null discards the output so nothing here depends on decode.
-timeout 30 ffmpeg -v error -i "$RTMP/$STREAM?$(sign_for)" -t 2 -f null - \
+timeout 30 ffmpeg -v error -i "$RTMP/$STREAM?$(sign_with "$KEY" "live/$STREAM")" -t 2 -f null - \
     >/dev/null 2>&1 || fail "the RTMP player could not play live/$STREAM"
 echo "  an RTMP player joined for 2s and left"
 

@@ -33,7 +33,7 @@ deploy/nginx/
   html/                 rtcplayer.html / flv.min.js（flv.js v1.6.2）/ hmac-sha256.js
 client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）、lib/token.mjs（HMAC）
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
-docs/                   设计、评估、实现指南、nginx 编程规范（中文）
+docs/                   架构、详细设计、多 worker shm 设计、编译、测试、部署侧规范（中文）
   images/               README 截图
 run.sh                  sync / nginx / push / keep-push / stop / verify
 ```
@@ -107,7 +107,7 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 
 ## 测试
 
-- host 单测：在 [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module) 里 `make -C test test`（纯 C，无 nginx）。
+- host 单测：在 [nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module) 里 `make -C test test`（Linux 下按真实 nginx 头构建，另有一套 stub 头世界）。
 - 端到端：`./run.sh verify`（werift 播放冒烟）。
 
 ## License

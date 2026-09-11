@@ -1,12 +1,7 @@
 # 部署侧编程规范(deploy/**/*.lua、scripts/*.sh、client/*.mjs)
 
 > 本仓没有 C 源码 —— `vendor/` 与 `build/src/` 里的都是独立仓 `nginx-rtc-module` 的副本。
-> **C 部分规范只在该仓 `docs/nginx-coding-standards.md`**,本文件不再同步一份。
->
-> 曾经同步过,结果是两份复制体各自漂移:本文件把 `ngx_event_recvmsg()` 的循环边界抄成了
-> `while (ev->available)`,而 nginx 源码写的是 `do { ... } while (ev->available)`
-> (`event/ngx_event_udp.c:67` 与 `:347`)。结论没受影响,但引用对不上源码,照着核会核不对。
-> 维护一份副本的成本,高于为此多读一个文件。
+> **C 部分规范只在模块仓 `nginx-rtc-module/docs/nginx-coding-standards.md`**,本文件不重复。
 
 ## 结论
 

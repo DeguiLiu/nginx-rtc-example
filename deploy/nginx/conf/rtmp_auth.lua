@@ -1,8 +1,18 @@
--- RTMP publish authorization, invoked by the RTMP on_publish notify callback.
+-- RTMP notify authorization, shared by on_publish and on_play.
+--
 -- The notify module POSTs urlencoded fields; the stream query string (e.g.
--- "key=demo-key-123") is appended verbatim as top-level form fields, so the
--- key arrives as the "key" field. A 2xx response accepts the publish.
+-- "?t=..&sign=..") is appended verbatim as top-level form fields, so the token
+-- arrives as the "t" and "sign" fields. A 2xx response accepts the operation.
+--
+-- One file for both hooks because they differ only in which secret the token
+-- must verify against: publishing uses the server-only publish secret, playing
+-- uses the play secret that the player pages also carry. The purpose is read
+-- from the URI rather than passed as a query arg, because nginx-rtmp builds the
+-- notify request itself and the only part of it this config controls is the
+-- path.
 local config = require "config"
+
+local purpose = ngx.var.uri:match("on_publish") and "publish" or "play"
 
 ngx.req.read_body()
 local args, err = ngx.req.get_post_args()
@@ -25,8 +35,8 @@ if ("string" ~= type(app)) or ("string" ~= type(name)) then
     return ngx.exit(400)
 end
 
-if not config.verify(app .. "/" .. name, t, sign) then
-    ngx.log(ngx.WARN, "rtmp_auth: deny publish ", app, "/", name,
+if not config.verify(app .. "/" .. name, t, sign, purpose) then
+    ngx.log(ngx.WARN, "rtmp_auth: deny ", purpose, " ", app, "/", name,
             " t=", tostring(t), " sign=", tostring(sign))
     return ngx.exit(403)
 end

@@ -17,5 +17,14 @@
 local key = ngx.ctx.flvcnt_key
 if key then
     -- shared-dict API: no decr(), incr() accepts negatives
-    ngx.shared.rtc_stats:incr(key, -1)
+    local v = ngx.shared.rtc_stats:incr(key, -1)
+    -- A close whose own increment has already aged out finds no key, incr
+    -- returns nil, and nothing happens -- correct, the slot is gone anyway.
+    -- A close that lands after newer viewers re-created the key would drive the
+    -- count negative, which is never meaningful: /rtc/v1/flvcnt filters out
+    -- non-positive entries, so a negative value hides the real count instead of
+    -- showing a wrong one. Clamp it.
+    if v and v < 0 then
+        ngx.shared.rtc_stats:set(key, 0)
+    end
 end
