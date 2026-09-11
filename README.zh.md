@@ -14,16 +14,15 @@ ffmpeg/WHIP → nginx (RTMP/HTTP) → 模块 (bridge → shm 媒体环 → SRTP/
 
 下面两个播放页跑的是同一路流；左上角烧录的北京秒表，就是用来看延迟差的那一眼：
 
-| HTTP-FLV（`/flvplayer`） | WebRTC（`/rtcplayer.html`） |
-|---|---|
-| ![HTTP-FLV 播放页](docs/images/HTTP-FLV.png) | ![WebRTC 播放页](docs/images/webrtc.png) |
+左为 HTTP-FLV（`/flvplayer`），右为 WebRTC（`/rtcplayer.html`）：
 
-<!-- docs/images/webrtc.png 目前还是生成的占位图；把 /rtcplayer.html 的真实截图
-     按同名覆盖即可，本表无需改动。 -->
+![HTTP-FLV 与 WebRTC 播放页并排对比](docs/images/webrtc-vs-http-flv.png)
+
+<!-- 一张图含两个真实页面：右半是实际打开的 /rtcplayer.html，两个秒表可直接对比。 -->
 
 ## 仓库划分
 
-C 源码在独立公开仓 [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)（MIT）。本仓只留组装件：deploy 配置 + Lua、播放页、client 脚本、构建运维脚本、文档。设计细节见 `docs/`（架构、多 worker shm 设计、评估报告等）。
+C 源码在独立公开仓 [DeguiLiu/nginx-rtc-module](https://github.com/DeguiLiu/nginx-rtc-module)（MIT）。本仓只留组装件：deploy 配置 + Lua、播放页、client 脚本、构建运维脚本、文档。设计细节见 `docs/`（`架构设计.md`、`详细设计.md`、`multi-worker-shm-design.md`）。
 
 ## 目录
 
