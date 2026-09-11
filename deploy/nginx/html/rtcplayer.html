@@ -271,7 +271,7 @@ async function play() {
     const res = await fetch(api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, clientip: host, t: String(tk.t), sign: tk.sign }),
+      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, t: String(tk.t), sign: tk.sign }),
     });
     const data = await res.json().catch(() => null);
     if (!data) {

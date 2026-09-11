@@ -189,7 +189,6 @@ async function main() {
       sdp: offer.sdp,
       streamurl: opts.stream,
       api: opts.api,
-      clientip: "127.0.0.1",
       t: String(t),
       sign,
     }),

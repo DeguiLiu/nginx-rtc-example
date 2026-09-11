@@ -459,7 +459,6 @@ async function runOne(target, opts) {
           sdp: offer.sdp,
           streamurl: target.stream,
           api: apiBase,
-          clientip: "127.0.0.1",
           t: String(t),
           sign,
         }),
