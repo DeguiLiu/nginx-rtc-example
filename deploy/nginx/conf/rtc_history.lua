@@ -43,7 +43,9 @@ local function sample(premature)
 
     local dict = ngx.shared.rtc_stats_history
     local slot = now_slot()
-    local ts = math.floor(ngx.now())
+    -- ngx.time(), not math.floor(ngx.now()): this is a whole-second stamp, and
+    -- now_slot() above has already refreshed the cached time with ngx.now().
+    local ts = ngx.time()
     local pt = {
         ts = ts,
         streams = d.total_streams or 0,

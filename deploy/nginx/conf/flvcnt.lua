@@ -9,6 +9,7 @@
 -- > 1; this dict-based counter is not.
 --
 -- Response: {"code":0,"streams":[{"name":"live/livestream","viewers":2}]}
+local ngx = ngx
 local cjson = require "cjson"
 cjson.encode_empty_table_as_object(false)   -- empty streams -> [] not {}
 

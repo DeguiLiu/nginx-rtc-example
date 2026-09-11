@@ -10,9 +10,14 @@
 -- from the URI rather than passed as a query arg, because nginx-rtmp builds the
 -- notify request itself and the only part of it this config controls is the
 -- path.
+local ngx = ngx
 local config = require "config"
 
-local purpose = ngx.var.uri:match("on_publish") and "publish" or "play"
+-- string.find with plain=true, not :match: the needle is a literal with no
+-- pattern metacharacters, so plain search skips pattern compilation on a hook
+-- that runs once per publish and once per play.
+local purpose = string.find(ngx.var.uri, "on_publish", 1, true) and "publish"
+                or "play"
 
 ngx.req.read_body()
 local args, err = ngx.req.get_post_args()

@@ -14,6 +14,8 @@
 -- The decrement is a bare incr() rather than get()+incr(): the read is not
 -- atomic with the write, so two log phases racing on the same key could both
 -- observe cur == 1 and both subtract.
+local ngx = ngx
+
 local key = ngx.ctx.flvcnt_key
 if key then
     -- shared-dict API: no decr(), incr() accepts negatives

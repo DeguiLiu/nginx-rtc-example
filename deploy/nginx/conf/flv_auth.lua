@@ -1,5 +1,6 @@
 -- HTTP-FLV playback authorization, aligned with /rtc/v1/play/.
 -- URL: /live?app=live&stream=livestream&t=<exp>&sign=<base64url(HMAC-SHA256)>
+local ngx = ngx
 local config = require "config"
 
 local app = ngx.var.arg_app

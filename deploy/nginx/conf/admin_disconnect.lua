@@ -20,8 +20,13 @@ if not name or name == "" then
     return
 end
 
-local res = ngx.location.capture("/internal/rtc/disconnect?name=" .. name, {
+-- The name goes through `args` rather than into the URI string: it is raw client
+-- input and carries a "/", and interpolating it by hand would let an "&" or "="
+-- split the subrequest's arguments. ngx.location.capture encodes a table with
+-- ngx.encode_args, the same form admin_kick.lua uses for its id.
+local res = ngx.location.capture("/internal/rtc/disconnect", {
     method = ngx.HTTP_POST,
+    args = { name = name },
 })
 
 if not res then

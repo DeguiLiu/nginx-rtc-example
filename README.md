@@ -95,7 +95,14 @@ Prefix resolution: `OPENRESTY_PREFIX`, then `build/nginx`, else error. `run.sh n
 | 1935 RTMP | push ingest + HTTP-FLV source |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
-Auth is an HMAC token: `t` = expiry seconds, `sign` = base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`)). Demo secret: `demo-secret-0123456789abcdef0123456789abcdef`. Per-stream secrets are in `deploy/nginx/conf/stream_keys.lua`.
+Auth is an HMAC token: `t` = expiry seconds, `sign` = base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`)). Each stream has **two** secrets in `deploy/nginx/conf/stream_keys.lua`, and which one verifies a token depends on what the token is for:
+
+| key | used by | ships to clients? |
+|---|---|---|
+| `<app>/<stream>\|play` | `/rtc/v1/play/`, `/live` (HTTP-FLV) | yes — it is embedded in `rtcplayer.html`, so treat it as public |
+| `<app>/<stream>\|publish` | RTMP `on_publish`, `/whip/endpoint` | no |
+
+Demo values: play `demo-secret-0123456789abcdef0123456789abcdef`, publish `push-secret-9f8e7d6c5b4a39281706f5e4d3c2b1a0`. Publishing with the play secret is rejected (403) — that is the point of the split, since anyone who can load the player page holds the play secret.
 
 ### Recording
 

@@ -1,6 +1,7 @@
 -- Prometheus /metrics endpoint (text exposition format).
 -- Reads the C-side stats snapshot mirrored into lua_shared_dict rtc_stats.
 
+local ngx = ngx
 local cjson = require "cjson"
 
 local raw = ngx.shared.rtc_stats:get("stats")
@@ -32,7 +33,13 @@ local function sample(name, labels, value)
     if labels and next(labels) then
         local parts = {}
         for k, v in pairs(labels) do
-            parts[#parts + 1] = k .. '="' .. tostring(v):gsub('"', '\\"') .. '"'
+            -- Prometheus exposition requires backslash, double quote and newline
+            -- to be escaped. Backslash must go first or the escapes inserted for
+            -- the other two get doubled; a value ending in a backslash otherwise
+            -- escapes its own closing quote and truncates the label set.
+            parts[#parts + 1] = k .. '="'
+                .. tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n")
+                .. '"'
         end
         table.sort(parts)
         l = "{" .. table.concat(parts, ",") .. "}"
