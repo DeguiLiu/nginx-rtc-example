@@ -8,10 +8,9 @@
 -- against the same publish secret. Publishing is publishing, whichever
 -- transport carries it.
 --
--- Query args rather than a header: client/whip_push.mjs builds its URL as
--- "<api>/whip/endpoint?app=<app>&stream=<stream>", so a caller appends
--- "&t=..&sign=.." into WHIP_STREAM and the client needs no token awareness.
--- Give it a real flag once that file is not being edited concurrently.
+-- Query args rather than a header: client/whip_push.mjs signs its own token
+-- from WHIP_KEY and appends "t=..&sign=.." to its URL, so the credential sits
+-- beside app/stream, exactly where the FLV and RTMP paths already put it.
 local ngx = ngx
 local config = require "config"
 

@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { writeSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { signToken } from "./lib/token.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -24,6 +25,18 @@ const MAX_RTP_PAYLOAD = 1200;
 const API = process.env.WHIP_API || "http://127.0.0.1:18082";
 const APP = process.env.WHIP_APP || "live";
 const STREAM = process.env.WHIP_STREAM || "whiptest";
+
+// Ingest secret for <app>/<stream>. No default, unlike lib/token.mjs DEMO_KEY:
+// the publish secret is the one credential that must not travel with a client
+// (see deploy/nginx/conf/stream_keys.lua), and a copy compiled in here would
+// make whoever holds this file a publisher. Playback has a default precisely
+// because the player pages already ship that secret.
+//
+// Callers used to work around the missing credential by splicing "t=..&sign=.."
+// into WHIP_STREAM, which the client pasted into its URL verbatim: the stream
+// name carried the query. That left `node client/whip_push.mjs` a bare 403 on
+// its own, and put a second, hand-rolled HMAC next to every caller.
+const KEY = process.env.WHIP_KEY || "";
 
 // Bounded signaling: without an AbortSignal a hung /whip/endpoint request makes
 // this script wait forever, which in turn hangs scripts/e2e-whip-release.sh.
@@ -330,6 +343,13 @@ function createH264Track() {
 }
 
 async function main() {
+  if (!KEY) {
+    log("[FAIL] WHIP_KEY is required: the publish secret for " + APP + "/" + STREAM);
+    log("       take it from deploy/nginx/conf/stream_keys.lua (the |publish entry), e.g.");
+    log("       WHIP_KEY=<secret> node client/whip_push.mjs");
+    process.exit(1);
+  }
+
   const pc = new RTCPeerConnection({
     codecs: {
       audio: [useOPUS({ payloadType: OPUS_PT })],
@@ -354,8 +374,9 @@ async function main() {
   await pc.setLocalDescription(offer);
   log("[whip] offer created");
 
+  const { t, sign } = signToken(KEY, `${APP}/${STREAM}`);
   const res = await fetch(
-    `${API}/whip/endpoint?app=${APP}&stream=${STREAM}`,
+    `${API}/whip/endpoint?app=${APP}&stream=${STREAM}&t=${t}&sign=${sign}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/sdp" },

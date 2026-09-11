@@ -83,7 +83,9 @@ echo "[setup] using live/$STREAM"
 # --- 1b. this stream's ingest token --------------------------------------
 # Ingests authenticate with the publish secret, which is a different secret from
 # the one the player pages carry (deploy/nginx/conf/stream_keys.lua). Both WHIP
-# and RTMP below push, so both use this one token: sign =
+# and RTMP below push, so both need it, in the form each transport takes: the
+# secret itself goes to whip_push.mjs, which signs, and QS is the pre-built
+# "t=..&sign=.." for the RTMP URL, where sign =
 # base64url(HMAC-SHA256(publish_secret, "<app>/<stream>|t=<t>")).
 secret_for() {  # <appstream> <purpose> -> secret from stream_keys.lua
     python3 -c '
@@ -116,11 +118,13 @@ trap 'rm -f "$LOG"' EXIT
 # `|| RC=$?` keeps `set -e` from aborting before the 409 check below can explain
 # the failure.
 #
-# WHIP_STREAM carries the token because whip_push.mjs splices WHIP_STREAM into
-# the endpoint URL verbatim -- APPENDING it here is what lets the client satisfy
-# the new access_by_lua_file without that file needing to know about tokens.
+# WHIP_KEY, not a spliced token: whip_push.mjs signs its own
+# "<app>/<stream>|t=<t>" query from the secret. It used to take the whole query
+# string inside WHIP_STREAM, which the client pasted into the URL -- that made
+# the stream name carry the credential and left the client unable to
+# authenticate on its own.
 RC=0
-WHIP_STREAM="$STREAM&$QS" WHIP_DURATION=5000 \
+WHIP_KEY="$PUB_KEY" WHIP_STREAM="$STREAM" WHIP_DURATION=5000 \
     timeout $((READY_TIMEOUT_S + SLACK_S)) node "$BASE/client/whip_push.mjs" \
     >"$LOG" 2>&1 || RC=$?
 [ "$RC" != 124 ] || { cat "$LOG"; fail "whip_push hung: no exit within $((READY_TIMEOUT_S + SLACK_S))s"; }

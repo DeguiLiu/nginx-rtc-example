@@ -1,9 +1,16 @@
 @echo off
 chcp 65001 >nul
 
+rem Prefer a bundled tools\ffmpeg.exe, otherwise take ffmpeg from PATH.
+rem This package does not ship one: ffmpeg's licence and size are its own, and
+rem the deploy config is what this package is for.
 set "FF=%~dp0tools\ffmpeg.exe"
-if not exist "%FF%" (
-    echo [ERROR] 未找到 %FF%
+if not exist "%FF%" set "FF="
+if not defined FF for %%I in (ffmpeg.exe) do if not defined FF set "FF=%%~$PATH:I"
+if not defined FF (
+    echo [ERROR] 找不到 ffmpeg。
+    echo         把任意 Windows 版 ffmpeg.exe 放到 "%~dp0tools\" 下，
+    echo         或安装 ffmpeg 并把它加进 PATH，然后重新双击本文件。
     pause
     exit /b 1
 )

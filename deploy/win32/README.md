@@ -9,7 +9,7 @@ Windows 版 nginx 不支持 UDP（`nginx.org/en/docs/windows.html`），因此�
 - `lib*.dll` / `lua51.dll` —— 运行时依赖，必须与 `nginx.exe` 同目录
 - `conf/` —— 配置（已去掉 WebRTC/UDP 段，`worker_processes 1`）
 - `html/` —— 播放页（`flvplayer` 用 flv.js 播放 HTTP-FLV）
-- `tools/ffmpeg.exe` —— 内置推流工具（无需单独安装 ffmpeg）
+- `tools/` —— 可选；放一个 Windows 版 `ffmpeg.exe` 进去，`push_test.bat` 会优先用它
 - `start.bat` / `stop.bat` —— 启停脚本
 - `push_test.bat` —— 一键推测试流
 
@@ -26,8 +26,9 @@ nginx.exe -p .
 
 ## 推流（RTMP）
 
-方式一（推荐）：双击 `push_test.bat`，用内置 `tools/ffmpeg.exe` 生成测试图案自动推
-`live/livestream`，无需安装 ffmpeg、无需准备视频文件。
+方式一（推荐）：双击 `push_test.bat`，它生成彩色测试图案自动推 `live/livestream`，
+无需准备视频文件。ffmpeg 由你提供：本包**不含** `ffmpeg.exe`（许可证与体积都归它自己），
+脚本先找 `tools\ffmpeg.exe`，找不到就用 PATH 上的 `ffmpeg`。
 
 方式二：用 ffmpeg 或 OBS 推自己的流，流名 `STREAM` 可自定义：
 

@@ -22,11 +22,38 @@ set -euo pipefail
 
 BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # OpenResty installs a bundle at --prefix and nginx itself under <prefix>/nginx,
-# which is why the production instance lives at build/nginx/nginx too.
-ASAN_PREFIX=${1:-"$BASE/build/nginx-asan/nginx"}
+# which is why the production instance lives at build/nginx/nginx too. The two
+# levels are load-bearing: scripts/build-openresty.sh was invoked with
+# OPENRESTY_PREFIX=build/nginx-asan/nginx, so the sanitized nginx is at
+# build/nginx-asan/nginx/nginx. The shorter path is NOT a synonym -- it is the
+# bundle root, and a build that once used it directly left its own sbin/nginx
+# there (Sep 10, against a different luajit). A run pointed at it tests that
+# binary instead of the current source, so the shape is checked below.
+ASAN_PREFIX=${1:-"$BASE/build/nginx-asan/nginx/nginx"}
 NORMAL_PREFIX="$BASE/build/nginx/nginx"
 
+KEEP_PUSH_PID=/tmp/rtc_keep_push.pid   # run.sh's supervisor pidfiles
+KEEP_TC_PID=/tmp/rtc_keep_tc.pid
+
 NORMAL_WAS_RUNNING=0
+NORMAL_HAD_SUPERVISORS=0
+
+supervisor_up() {   # pidfile -> 0 when its supervisor is alive
+    local pid
+    [ -f "$1" ] || return 1
+    pid="$(cat "$1" 2>/dev/null)" || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# A bundle root carries sbin/nginx of its own, so it satisfies the -x check
+# below while being the wrong directory. The tell is the nested install.
+if [ -x "$ASAN_PREFIX/nginx/sbin/nginx" ]; then
+    echo "$ASAN_PREFIX is an OpenResty bundle root, not nginx's own prefix." >&2
+    echo "  Its sbin/nginx belongs to whichever build last installed there; the" >&2
+    echo "  current one is under nginx/. Pass the nested path:" >&2
+    echo "    $ASAN_PREFIX/nginx" >&2
+    exit 1
+fi
 
 if [ ! -x "$ASAN_PREFIX/sbin/nginx" ]; then
     echo "no sanitized nginx at $ASAN_PREFIX/sbin/nginx" >&2
@@ -124,7 +151,17 @@ restore() {
     fi
 
     if [ "$NORMAL_WAS_RUNNING" = 1 ]; then
-        OPENRESTY_PREFIX="$NORMAL_PREFIX" "$BASE/run.sh" nginx >/dev/null 2>&1
+        # `run.sh stop` above tears the keep-push / keep-transcode supervisors
+        # down along with nginx, so restoring nginx alone leaves a tree that
+        # answers /rtc/v1/stats with an empty streams[] and pushes nothing --
+        # healthy-looking, and useless for the next check that reads it. Start
+        # back exactly what was there: `run.sh start` when the supervisors were
+        # up, `nginx` when only nginx was.
+        if [ "$NORMAL_HAD_SUPERVISORS" = 1 ]; then
+            OPENRESTY_PREFIX="$NORMAL_PREFIX" "$BASE/run.sh" start >/dev/null 2>&1
+        else
+            OPENRESTY_PREFIX="$NORMAL_PREFIX" "$BASE/run.sh" nginx >/dev/null 2>&1
+        fi
         # Poll, do not curl once: `run.sh nginx` returns as soon as the master
         # forks, well before the workers are accepting. A single 3s probe here
         # reports "did not come back up" on a restore that in fact succeeded,
@@ -141,6 +178,19 @@ restore() {
         else
             echo "   ERROR: normal instance did not come back up" >&2
         fi
+        if [ "$NORMAL_HAD_SUPERVISORS" = 1 ]; then
+            # The supervisors write their pidfiles themselves, so their presence
+            # is the direct signal; ffmpeg takes a moment to be spawned.
+            for _ in $(seq 1 20); do
+                supervisor_up "$KEEP_PUSH_PID" && supervisor_up "$KEEP_TC_PID" && break
+                sleep 1
+            done
+            if supervisor_up "$KEEP_PUSH_PID" && supervisor_up "$KEEP_TC_PID"; then
+                echo "   supervisors back (keep-push, keep-transcode)"
+            else
+                echo "   ERROR: supervisors did not come back; run ./run.sh start" >&2
+            fi
+        fi
     else
         echo "   normal instance was not running before; left stopped"
     fi
@@ -151,7 +201,12 @@ trap restore EXIT
 # --- 0. remember what we are about to disrupt -----------------------------
 if curl -fsS --max-time 2 http://127.0.0.1:18082/rtc/v1/stats >/dev/null 2>&1; then
     NORMAL_WAS_RUNNING=1
-    echo "[0] normal instance is up; it will be stopped and restored at the end"
+    # Captured before the stop, because `run.sh stop` takes the supervisors with
+    # it: after it, a pidfile that is gone says nothing about what was running.
+    if supervisor_up "$KEEP_PUSH_PID" || supervisor_up "$KEEP_TC_PID"; then
+        NORMAL_HAD_SUPERVISORS=1
+    fi
+    echo "[0] normal instance is up (supervisors: $NORMAL_HAD_SUPERVISORS); it will be stopped and restored at the end"
     OPENRESTY_PREFIX="$NORMAL_PREFIX" "$BASE/run.sh" stop >/dev/null 2>&1 || true
     sleep 1
 fi
@@ -212,20 +267,15 @@ run_step "RTMP push + webrtc play" bash -c '
 '
 
 # WHIP ingest: DTLS handshake, SRTP keying, session creation in the glue layer.
-# WHIP now requires an ingest token, and whip_push.mjs splices WHIP_STREAM into
-# the endpoint URL verbatim, so the query rides along with the stream name --
-# see conf/whip_auth.lua.
-run_step "WHIP publish" env WHIP_STREAM="whiptest&$(python3 -c '
-import base64, hashlib, hmac, re, sys, time
+# whip_push.mjs signs its own ingest token from WHIP_KEY (see conf/whip_auth.lua
+# for the check), so the only thing this needs from the deploy config is the
+# publish secret -- no second copy of the token algorithm here.
+run_step "WHIP publish" env WHIP_KEY="$(python3 -c '
+import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"\[\"live/whiptest\|publish\"\]\s*=\s*\"([^\"]+)\"", src)
-key = m.group(1) if m else ""
-t = str(int(time.time()) + 300)
-sig = base64.urlsafe_b64encode(
-    hmac.new(key.encode(), ("live/whiptest|t=%s" % t).encode(), hashlib.sha256
-).digest()).decode().rstrip("=")
-print("t=%s&sign=%s" % (t, sig))
-' "$BASE/deploy/nginx/conf/stream_keys.lua")" WHIP_DURATION=6000 \
+print(m.group(1) if m else "")
+' "$BASE/deploy/nginx/conf/stream_keys.lua")" WHIP_STREAM=whiptest WHIP_DURATION=6000 \
     node "$BASE/client/whip_push.mjs"
 
 # Publish-ownership arbitration (the regression guard from the FSM review).
