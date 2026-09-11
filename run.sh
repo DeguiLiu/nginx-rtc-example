@@ -338,9 +338,9 @@ case "${1:-}" in
     keep-push) keep_push ;;
     keep-transcode) keep_transcode ;;
     stop)    stop ;;
-    verify)  node "$BASE/client/play.mjs" ;;
+    verify)  shift; node "$BASE/client/play.mjs" "$@" ;;
     ngxtop)  shift; ngxtop "$@" ;;
     *)
-        echo "用法: $0 {sync|nginx|start|push|transcode|keep-push|keep-transcode|stop|verify|ngxtop}"
+        echo "用法: $0 {sync|nginx|start|push|transcode|keep-push|keep-transcode|stop|verify [play.mjs 参数]|ngxtop [参数]}"
         exit 1 ;;
 esac

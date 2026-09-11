@@ -1,24 +1,42 @@
 import { RTCPeerConnection, useH264, useOPUS } from "werift";
-import { createHmac } from "node:crypto";
 import { writeSync } from "node:fs";
 
+import { DEMO_KEY, signToken, streamPathOf } from "./lib/token.mjs";
+
 const DEFAULT_STREAM = "webrtc://127.0.0.1:18082/live/livestream";
-const DEFAULT_KEY = "demo-secret-0123456789abcdef0123456789abcdef";
+const DEFAULT_KEY = DEMO_KEY;
 const DEFAULT_API = "http://127.0.0.1:18082";
 const DEFAULT_DURATION = 8000;
+
+/* Loss is measured only after this much of a track has been received. The
+ * server replays its cached GOP the moment SRTP becomes ready, so the first
+ * packets after connect are a deliberately discontinuous burst; on a 4 s
+ * window the largest sequence gap sits at the 3rd received packet and measured
+ * 8..5952 packets, which read as 1.4%..83% "loss" on a link that lost nothing.
+ * --warmup 0 restores the old whole-window number. */
+const DEFAULT_WARMUP = 1000;
 
 const DTLS_TIMEOUT_MS = 5000;
 const MEDIA_TIMEOUT_MS = 3000;
 const SIGNAL_TIMEOUT_MS = 5000;
 
 function printHelp() {
+  // Interpolated rather than written out: the previous hand-written text
+  // promised `--key ... default demo-key-123` while the code defaulted to the
+  // demo secret, so following the help verbatim produced a 403.
   const lines = [
     "usage: node play.mjs [options]",
-    "  --stream <url>    stream URL (default webrtc://127.0.0.1:18082/live/livestream)",
-    "  --key <key>       stream key (default demo-key-123)",
-    "  --api <url>       signaling API base URL (default http://127.0.0.1:18082)",
-    "  --duration <ms>   receive duration in milliseconds (default 8000)",
-    "  --json            print the result as a single JSON object to stdout",
+    `  --stream <url>    stream URL; repeatable, played in order`,
+    `                    (default ${DEFAULT_STREAM})`,
+    `  --key <key>       stream key; repeatable, paired with --stream by position.`,
+    `                    Fewer keys than streams repeats the last one, which is what`,
+    `                    makes a single key cover a whole transcode ladder.`,
+    `                    (default ${DEFAULT_KEY})`,
+    `  --api <url>       signaling API base URL (default ${DEFAULT_API})`,
+    `  --duration <ms>   receive duration per stream (default ${DEFAULT_DURATION})`,
+    `  --warmup <ms>     exclude this much of each track from loss accounting`,
+    `                    (default ${DEFAULT_WARMUP}; 0 = count from the first packet)`,
+    "  --json            one JSON object per stream, one per line, on stdout",
     "  --dump            enable per-packet debug dump (written to stderr)",
   ];
   writeSync(1, lines.join("\n") + "\n");
@@ -27,10 +45,11 @@ function printHelp() {
 
 function parseArgs(argv) {
   const opts = {
-    stream: DEFAULT_STREAM,
-    key: DEFAULT_KEY,
+    streams: [],
+    keys: [],
     api: DEFAULT_API,
     duration: DEFAULT_DURATION,
+    warmup: DEFAULT_WARMUP,
     json: false,
     dump: false,
   };
@@ -54,16 +73,19 @@ function parseArgs(argv) {
     };
     switch (name) {
       case "--stream":
-        opts.stream = take();
+        opts.streams.push(take());
         break;
       case "--key":
-        opts.key = take();
+        opts.keys.push(take());
         break;
       case "--api":
         opts.api = take();
         break;
       case "--duration":
         opts.duration = Number.parseInt(take(), 10);
+        break;
+      case "--warmup":
+        opts.warmup = Number.parseInt(take(), 10);
         break;
       case "--json":
         opts.json = true;
@@ -79,44 +101,28 @@ function parseArgs(argv) {
         throw new Error(`unknown option: ${arg}`);
     }
   }
+  if (0 === opts.streams.length) {
+    opts.streams.push(DEFAULT_STREAM);
+  }
+  if (opts.keys.length > opts.streams.length) {
+    throw new Error(
+      `${opts.keys.length} --key for ${opts.streams.length} --stream: too many keys`
+    );
+  }
   if (!Number.isFinite(opts.duration) || opts.duration <= 0) {
     throw new Error("invalid --duration (must be a positive integer in ms)");
   }
+  if (!Number.isFinite(opts.warmup) || opts.warmup < 0) {
+    throw new Error("invalid --warmup (must be a non-negative integer in ms)");
+  }
+  if (opts.warmup >= opts.duration) {
+    writeSync(
+      2,
+      `[warn] --warmup ${opts.warmup}ms >= --duration ${opts.duration}ms: every packet is ` +
+        `inside the warm-up, so loss_rate_percent is 0 by construction\n`
+    );
+  }
   return opts;
-}
-
-let opts;
-try {
-  opts = parseArgs(process.argv.slice(2));
-} catch (err) {
-  writeSync(2, `[FAIL] ${err.message}\n`);
-  process.exit(1);
-}
-
-const json = opts.json;
-const dumpEnabled = opts.dump;
-const apiBase = opts.api.replace(/\/+$/, "");
-const playUrl = `${apiBase}/rtc/v1/play/`;
-const startMs = Date.now();
-
-let finished = false;
-
-function log(msg) {
-  // In --json mode keep stdout clean: human logs go to stderr.
-  writeSync(json ? 2 : 1, msg + "\n");
-}
-
-function fail(reason, phase) {
-  if (finished) {
-    return;
-  }
-  finished = true;
-  if (json) {
-    writeSync(1, JSON.stringify({ ok: false, error: reason, phase }) + "\n");
-  } else {
-    writeSync(1, `[FAIL] ${reason}\n`);
-  }
-  process.exit(1);
 }
 
 function round2(n) {
@@ -135,8 +141,17 @@ function makeTrackStats(kind, isVideo) {
     keyframe: 0,
     keyframes: 0,
     frames: 0,
+    /* lost is the whole-window count and exists only so the two windowed
+     * counters below can be audited against it in a single run: by
+     * construction lost === lostPost + warmupLost. */
     lost: 0,
+    lostPost: 0,
     lastSeq: -1,
+    /* Warm-up state. warmupUntil is an absolute Date.now() and is 0 once the
+     * track is past its warm-up (or once --warmup 0 disabled it). */
+    warmupUntil: 0,
+    warmupLost: 0,
+    postPkts: 0,
     jitter: 0,
     jitterInit: false,
     lastTransit: 0,
@@ -146,32 +161,53 @@ function makeTrackStats(kind, isVideo) {
   };
 }
 
-const stats = {
-  audio: makeTrackStats("audio", false),
-  video: makeTrackStats("video", true),
-};
-
 // Hot path: no object allocation, no string building, no optional chaining.
-function handleRtp(s, rtp) {
+// `run` carries the per-stream state, so nothing here reads a module global --
+// that is what lets one process play several streams in sequence.
+function handleRtp(s, rtp, run) {
   const now = Date.now();
   const payload = rtp.payload;
   const hdr = rtp.header;
 
   if (s.first === 0) {
-    s.first = now - startMs;
+    s.first = now - run.startMs;
+    /* Anchored to this track's first packet, not to process start: the
+     * ICE/DTLS handshake costs 500-700 ms and jitters run to run, so anchoring
+     * on startMs moves the measured window by whatever the handshake cost --
+     * which is how the same healthy stream came to report 1.4%..15.8%. */
+    s.warmupUntil = now + run.warmupMs;
   }
   s.pkts++;
   const size = (payload ? payload.length : 0) + 12;
   s.bytes += size;
 
   const seq = hdr.sequenceNumber;
+  const inWarmup = 0 !== s.warmupUntil && now < s.warmupUntil;
+
+  if (0 !== s.warmupUntil && !inWarmup) {
+    /* First packet past the boundary. Realign instead of charging the gap
+     * between the replay burst and the live stream as loss, and skip this
+     * packet's own delta too: a gap straddling the boundary is then dropped
+     * rather than attributed to either side. */
+    s.warmupUntil = 0;
+    s.lastSeq = -1;
+  }
+
   if (s.lastSeq >= 0) {
     const delta = (seq - s.lastSeq) & 0xffff;
     if (delta > 1 && delta < 0x8000) {
       s.lost += delta - 1;
+      if (inWarmup) {
+        s.warmupLost += delta - 1;
+      } else {
+        s.lostPost += delta - 1;
+      }
     }
   }
   s.lastSeq = seq;
+  if (!inWarmup) {
+    s.postPkts++;
+  }
 
   // RFC 3550 interarrival jitter, in milliseconds.
   const tsMs = (hdr.timestamp / s.clockRate) * 1000;
@@ -189,7 +225,7 @@ function handleRtp(s, rtp) {
   }
 
   // Real-time bitrate: track bytes per whole second.
-  const sec = Math.floor((now - startMs) / 1000);
+  const sec = Math.floor((now - run.startMs) / 1000);
   if (sec !== s.lastSec) {
     if (s.lastSec >= 0) {
       s.lastBucketBytes = s.curBucketBytes;
@@ -208,40 +244,35 @@ function handleRtp(s, rtp) {
       const nal = b0 === 28 && payload.length >= 2 ? payload[1] & 0x1f : b0;
       if (nal === 5) {
         if (s.keyframe === 0) {
-          s.keyframe = now - startMs;
-          log(`[keyframe] first H264 IDR at ${s.keyframe} ms`);
+          s.keyframe = now - run.startMs;
+          run.log(`[keyframe] first H264 IDR at ${s.keyframe} ms`);
         }
         s.keyframes++;
       }
     }
   }
 
-  if (dumpEnabled && payload && payload.length >= 1) {
+  if (run.dumpEnabled && payload && payload.length >= 1) {
     const b0 = payload[0] & 0x1f;
     const nalName =
       b0 === 28 ? "FU-A" : b0 === 24 ? "STAP-A" : b0 === 5 ? "IDR" : `NAL${b0}`;
+    // The stream label is part of the line: with several streams in one run
+    // the packets are otherwise impossible to attribute.
     writeSync(
       2,
-      `[dump] ${s.kind} seq=${hdr.sequenceNumber} ts=${hdr.timestamp} len=${payload.length} nal=${nalName}\n`
+      `[dump] ${run.label} ${s.kind} seq=${hdr.sequenceNumber} ts=${hdr.timestamp} ` +
+        `len=${payload.length} nal=${nalName}\n`
     );
   }
 }
 
-function finalizeResult() {
-  const elapsedMs = Date.now() - startMs;
-  const ok = stats.audio.pkts > 0 && stats.video.pkts > 0;
-  const result = {
-    ok,
-    duration_ms: elapsedMs,
-    audio: buildTrackResult(stats.audio, elapsedMs),
-    video: buildTrackResult(stats.video, elapsedMs),
-  };
-  return result;
-}
-
 function buildTrackResult(s, elapsedMs) {
-  const received = s.pkts;
-  const lossRate = received > 0 ? (s.lost / (received + s.lost)) * 100 : 0;
+  /* The denominator is the post-warm-up received count, not s.pkts: pairing a
+   * warm-up-excluded numerator with a whole-window denominator would understate
+   * the rate. Everything else here (bytes, bitrate, fps) deliberately still
+   * covers the whole window and is documented as such. */
+  const expected = s.postPkts + s.lostPost;
+  const lossRate = expected > 0 ? (s.lostPost / expected) * 100 : 0;
   const avgBitrateKbps = elapsedMs > 0 ? (s.bytes * 8) / elapsedMs : 0;
   const lastBitrateKbps =
     s.lastBucketBytes > 0 ? (s.lastBucketBytes * 8) / 1000 : avgBitrateKbps;
@@ -251,6 +282,12 @@ function buildTrackResult(s, elapsedMs) {
     codec: s.codec,
     first_packet_ms: s.first,
     loss_rate_percent: round2(lossRate),
+    lost_packets: s.lostPost,
+    warmup_lost_packets: s.warmupLost,
+    /* Invariant: lost_packets + warmup_lost_packets === lost_packets_all. A
+     * gap straddling the warm-up boundary is dropped from all three, so the
+     * warm-up never hides a loss that --warmup 0 would have shown. */
+    lost_packets_all: s.lost,
     jitter_ms: round2(s.jitter),
     avg_bitrate_kbps: round2(avgBitrateKbps),
     bitrate_kbps: round2(lastBitrateKbps),
@@ -263,27 +300,92 @@ function buildTrackResult(s, elapsedMs) {
   return r;
 }
 
-function printHuman(result) {
-  log("\n=== RTMP -> WebRTC media receive result ===");
+function finalizeResult(run) {
+  const elapsedMs = Date.now() - run.startMs;
+  const ok = run.stats.audio.pkts > 0 && run.stats.video.pkts > 0;
+  return {
+    ok,
+    stream: run.stream,
+    duration_ms: elapsedMs,
+    warmup_ms: run.warmupMs,
+    audio: buildTrackResult(run.stats.audio, elapsedMs),
+    video: buildTrackResult(run.stats.video, elapsedMs),
+  };
+}
+
+function printHuman(run, result) {
+  const log = run.log;
+  log(`\n=== ${run.label} ===`);
+  log(
+    `loss is measured after the first ${run.warmupMs} ms of each track; ` +
+      `packets/bytes/bitrate/fps cover the whole ${result.duration_ms} ms`
+  );
   for (const kind of ["audio", "video"]) {
-    const s = stats[kind];
+    const s = run.stats[kind];
     const r = result[kind];
     let line =
       `${kind}: packets=${s.pkts} bytes=${s.bytes} codec=${s.codec}` +
       ` first_packet_ms=${s.first} loss_rate=${r.loss_rate_percent}%` +
+      ` lost=${r.lost_packets}` +
       ` jitter_ms=${r.jitter_ms} bitrate_kbps=${r.bitrate_kbps}`;
+    if (r.warmup_lost_packets > 0) {
+      line += ` warmup_lost=${r.warmup_lost_packets}`;
+    }
     if (s.isVideo) {
       line += ` fps=${r.fps} keyframes=${s.keyframes}`;
     }
     log(line);
   }
   log(
-    `video: first_keyframe_ms=${stats.video.keyframe} (首个 H264 IDR 到达, 真正出图延迟口径)`
+    `video: first_keyframe_ms=${run.stats.video.keyframe} (首个 H264 IDR 到达, 真正出图延迟口径)`
   );
-  log(result.ok ? "\n[PASS] 音视频均经 WebRTC 收到 RTP 包" : "\n[FAIL] 未收到媒体包");
+  log(result.ok ? "[PASS] 音视频均经 WebRTC 收到 RTP 包" : "[FAIL] 未收到媒体包");
 }
 
-async function main() {
+/*
+ * Play one stream to completion and return its result object, or throw for a
+ * failure the caller should turn into a per-stream error record. Nothing here
+ * touches process state: several streams run in sequence in one process, so
+ * every counter and timer is local to this call.
+ */
+async function runOne(target, opts) {
+  const apiBase = opts.api.replace(/\/+$/, "");
+  const playUrl = `${apiBase}/rtc/v1/play/`;
+  const label = streamPathOf(target.stream);
+
+  const run = {
+    stream: target.stream,
+    label,
+    startMs: Date.now(),
+    warmupMs: opts.warmup,
+    dumpEnabled: opts.dump,
+    stats: {
+      audio: makeTrackStats("audio", false),
+      video: makeTrackStats("video", true),
+    },
+  };
+  run.log = (msg) => writeSync(opts.json ? 2 : 1, msg + "\n");
+
+  let finished = false;
+  let failure = null;
+  let abort;
+  const aborted = new Promise((resolve) => {
+    abort = resolve;
+  });
+
+  /* Records the failure for the caller and ends this stream's wait at once.
+   * It must not call process.exit: a later --stream is still owed a run. The
+   * timers below fire outside the awaited flow, which is why ending the wait
+   * takes an explicit signal rather than just falling out of scope. */
+  const fail = (reason, phase) => {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    failure = { ok: false, stream: run.stream, error: reason, phase };
+    abort();
+  };
+
   const pc = new RTCPeerConnection({
     codecs: {
       audio: [useOPUS()],
@@ -304,129 +406,192 @@ async function main() {
       if (finished) {
         return;
       }
-      if (stats.audio.pkts === 0 && stats.video.pkts === 0) {
+      if (run.stats.audio.pkts === 0 && run.stats.video.pkts === 0) {
         fail("media timeout: no RTP packets received", "media");
       }
     }, MEDIA_TIMEOUT_MS);
   };
 
-  pc.connectionStateChange.subscribe((state) => {
-    if (dumpEnabled) {
-      log(`[dtls] connectionState=${state}`);
-    }
-    if (state === "connected") {
-      dtlsConnected = true;
-      if (answerSet) {
-        armMediaTimeout();
-      }
-    } else if (state === "failed" || state === "closed") {
-      if (stats.audio.pkts === 0 && stats.video.pkts === 0) {
-        fail(`DTLS failed (state=${state})`, "dtls");
-      }
-    }
-  });
-
-  pc.onTrack.subscribe((track) => {
-    const isVideo = track.kind === "video";
-    const s = (stats[track.kind] = stats[track.kind] || makeTrackStats(track.kind, isVideo));
-    s.codec = track.codec?.mimeType || "";
-    if (track.codec?.clockRate) {
-      s.clockRate = track.codec.clockRate;
-    }
-    log(`[track] ${track.kind} ${s.codec}`);
-    track.onReceiveRtp.subscribe((rtp) => handleRtp(s, rtp));
-  });
-
-  pc.addTransceiver("audio", { direction: "recvonly" });
-  pc.addTransceiver("video", { direction: "recvonly" });
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  // HMAC token: t = expiry (unix s), sign = base64url(HMAC-SHA256(app/stream|t=t)).
-  const m = opts.stream.match(/^webrtc:\/\/[^/]+\/([^/]+)\/([^/]+)$/);
-  const app = m ? m[1] : "live";
-  const stream = m ? m[2] : "livestream";
-  const t = Math.floor(Date.now() / 1000) + 3600;
-  const msg = `${app}/${stream}|t=${t}`;
-  const sign = createHmac("sha256", opts.key).update(msg).digest("base64url");
-
-  let data;
   try {
-    const res = await fetch(playUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sdp: offer.sdp,
-        streamurl: opts.stream,
-        api: apiBase,
-        clientip: "127.0.0.1",
-        t: String(t),
-        sign,
-      }),
-      signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
+    pc.connectionStateChange.subscribe((state) => {
+      if (run.dumpEnabled) {
+        run.log(`[dtls] connectionState=${state}`);
+      }
+      if (state === "connected") {
+        dtlsConnected = true;
+        if (answerSet) {
+          armMediaTimeout();
+        }
+      } else if (state === "failed" || state === "closed") {
+        if (run.stats.audio.pkts === 0 && run.stats.video.pkts === 0) {
+          fail(`DTLS failed (state=${state})`, "dtls");
+        }
+      }
     });
-    const text = await res.text();
+
+    pc.onTrack.subscribe((track) => {
+      const isVideo = track.kind === "video";
+      const s = run.stats[track.kind] || makeTrackStats(track.kind, isVideo);
+      run.stats[track.kind] = s;
+      s.codec = track.codec?.mimeType || "";
+      if (track.codec?.clockRate) {
+        s.clockRate = track.codec.clockRate;
+      }
+      run.log(`[track] ${track.kind} ${s.codec}`);
+      track.onReceiveRtp.subscribe((rtp) => handleRtp(s, rtp, run));
+    });
+
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // HMAC token over the stream path; see client/lib/token.mjs.
+    const { t, sign } = signToken(target.key, label);
+
+    let data;
     try {
-      data = JSON.parse(text);
-    } catch {
-      fail(
-        `signaling returned non-JSON (HTTP ${res.status}): ${text.slice(0, 160)}`,
-        "signaling"
-      );
-      return;
+      const res = await fetch(playUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sdp: offer.sdp,
+          streamurl: target.stream,
+          api: apiBase,
+          clientip: "127.0.0.1",
+          t: String(t),
+          sign,
+        }),
+        signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
+      });
+      const text = await res.text();
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new StreamError(
+          `signaling returned non-JSON (HTTP ${res.status}): ${text.slice(0, 160)}`,
+          "signaling"
+        );
+      }
+    } catch (err) {
+      if (err instanceof StreamError) {
+        throw err;
+      }
+      const cause = err.cause
+        ? ` (${err.cause.code || "cause"} ${err.cause.message || ""})`
+        : "";
+      throw new StreamError(`signaling request failed: ${err.message}${cause}`, "signaling");
     }
-  } catch (err) {
-    const cause = err.cause ? ` (${err.cause.code || "cause"} ${err.cause.message || ""})` : "";
-    fail(`signaling request failed: ${err.message}${cause}`, "signaling");
-    return;
-  }
 
-  log(`[play] code: ${data.code}`);
-  if (data.code !== 0 || !data.sdp) {
-    fail(`signaling rejected: code=${data.code}`, "signaling");
-    return;
-  }
-
-  try {
-    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
-  } catch (err) {
-    fail(`setRemoteDescription failed: ${err.message}`, "signaling");
-    return;
-  }
-  log("[sdp] answer set, waiting for DTLS/SRTP media...");
-
-  answerSet = true;
-  if (dtlsConnected) {
-    armMediaTimeout();
-  }
-  dtlsTimer = setTimeout(() => {
-    if (finished) {
-      return;
+    run.log(`[play] code: ${data.code}`);
+    if (data.code !== 0 || !data.sdp) {
+      throw new StreamError(`signaling rejected: code=${data.code}`, "signaling");
     }
-    if (!dtlsConnected && stats.audio.pkts === 0 && stats.video.pkts === 0) {
-      fail(`DTLS timeout: connectionState=${pc.connectionState}`, "dtls");
+
+    try {
+      await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    } catch (err) {
+      throw new StreamError(`setRemoteDescription failed: ${err.message}`, "signaling");
     }
-  }, DTLS_TIMEOUT_MS);
+    run.log("[sdp] answer set, waiting for DTLS/SRTP media...");
 
-  await new Promise((r) => setTimeout(r, opts.duration));
+    answerSet = true;
+    if (dtlsConnected) {
+      armMediaTimeout();
+    }
+    dtlsTimer = setTimeout(() => {
+      if (finished) {
+        return;
+      }
+      if (!dtlsConnected && run.stats.audio.pkts === 0 && run.stats.video.pkts === 0) {
+        fail(`DTLS timeout: connectionState=${pc.connectionState}`, "dtls");
+      }
+    }, DTLS_TIMEOUT_MS);
 
-  if (dtlsTimer) {
-    clearTimeout(dtlsTimer);
+    await Promise.race([
+      new Promise((r) => setTimeout(r, opts.duration)),
+      aborted,
+    ]);
+
+    if (failure) {
+      throw new StreamError(failure.error, failure.phase);
+    }
+    run.result = finalizeResult(run);
+    return run;
+  } finally {
+    /* Both timers and the peer connection are per-stream and must not outlive
+     * this call: an unclosed PC keeps its sockets and its onReceiveRtp
+     * subscription pointing at this run's stats, and a leaked dtlsTimer would
+     * fire during a later stream and fail that one instead. */
+    if (dtlsTimer) {
+      clearTimeout(dtlsTimer);
+    }
+    if (mediaTimer) {
+      clearTimeout(mediaTimer);
+    }
+    await pc.close();
   }
-  if (mediaTimer) {
-    clearTimeout(mediaTimer);
+}
+
+class StreamError extends Error {
+  constructor(message, phase) {
+    super(message);
+    this.phase = phase;
+  }
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+
+  const targets = opts.streams.map((stream, i) => ({
+    stream,
+    // Fewer keys than streams repeats the last one: the whole ladder shares the
+    // demo secret, so `--stream a --stream b --key k` has to mean both.
+    key: 0 === opts.keys.length
+      ? DEFAULT_KEY
+      : opts.keys[Math.min(i, opts.keys.length - 1)],
+  }));
+
+  let failed = 0;
+  for (const target of targets) {
+    const label = streamPathOf(target.stream);
+    let run;
+    try {
+      run = await runOne(target, opts);
+    } catch (err) {
+      const record = {
+        ok: false,
+        stream: target.stream,
+        error: err.message,
+        phase: err.phase || "runtime",
+      };
+      if (opts.json) {
+        writeSync(1, JSON.stringify(record) + "\n");
+      } else {
+        writeSync(1, `[FAIL] ${label}: ${err.message}\n`);
+      }
+      failed++;
+      continue;
+    }
+    if (opts.json) {
+      writeSync(1, JSON.stringify(run.result) + "\n");
+    } else {
+      printHuman(run, run.result);
+    }
+    if (!run.result.ok) {
+      failed++;
+    }
   }
 
-  const result = finalizeResult();
-  if (json) {
-    writeSync(1, JSON.stringify(result) + "\n");
-  } else {
-    printHuman(result);
+  if (targets.length > 1) {
+    const line = `${targets.length - failed}/${targets.length} 路通过\n`;
+    writeSync(opts.json ? 2 : 1, line);
   }
-  process.exit(result.ok ? 0 : 1);
+  process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch((err) => {
-  fail(`unexpected error: ${err.message}`, "runtime");
+  writeSync(2, `[FAIL] unexpected error: ${err.message}\n`);
+  process.exit(1);
 });
