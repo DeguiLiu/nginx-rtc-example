@@ -295,12 +295,19 @@ function renderStats() {
   const now = Date.now();
   const run = now - t0;
 
-  // 首关键帧解码: flv.js 记录 performance 时间戳, 与启动点取差
-  if (st && st.firstVideoKeyFrameDecodedTime && !firstFrame) {
-    firstFrame = Math.max(0, st.firstVideoKeyFrameDecodedTime - performance.timeOrigin - t0 + now - performance.now());
-    if (firstFrame < 0) firstFrame = 0;
-    log("首帧: " + firstFrame.toFixed(0) + " ms");
-    setState("播放中", "ok");
+  // 出图判据: 用 statisticsInfo.video.decodedFrames (由 _fillStatisticsInfo 从
+  // getVideoPlaybackQuality().totalVideoFrames 填充), 这是这个 flv.js 版本真正
+  // 会写的字段。此前读的是 firstVideoKeyFrameDecodedTime —— 那是 mpegts.js 的
+  // 字段, 这里的 flv.min.js 从不设置它, 于是整块永远是 falsy, 状态永远停在
+  // "连接中…"、统计表永远显示"等待视频帧…"。直播第一帧必然是 IDR, 所以
+  // "已有帧被解码"就等价于"已出图"。
+  //
+  // 代价: 首帧耗时只能算到 now - t0, 精度取决于 renderStats 的调用间隔, 不再是
+  // flv.js 内部 performance 时间戳的毫秒级读数, 所以下面按秒取整、标签也据实改。
+  if (st && st.video && st.video.decodedFrames > 0 && !firstFrame) {
+    firstFrame = Math.max(0, now - t0);
+    log("出图: " + (firstFrame / 1000).toFixed(1) + " s");
+    setState("已连接", "ok");
     el.overlay.style.display = "none";
   }
 
@@ -320,7 +327,9 @@ function renderStats() {
   const dropCls = vd.dropped > 0 ? "loss" : "";
   const rows = [];
   rows.push(row("已运行", (run / 1000).toFixed(1) + " s"));
-  rows.push(row("首帧耗时", fmtMs(firstFrame)));
+  // 秒级, 因为 firstFrame 只能算到 now - t0 (见上): fmtMs 会把它渲染成
+  // "1234 ms" 这种毫秒级读数, 精度对不上, 所以这一行自己格式化。
+  rows.push(row("出图画面前耗时", firstFrame == null ? "—" : (firstFrame / 1000).toFixed(1) + " s"));
   rows.push(row("下载速度", fmtKBps(st ? st.speed : null)));
   rows.push(row("缓冲延迟(实时度)", st ? fmtMs(st.currentBufferLatency) : "—",
                 st && st.currentBufferLatency != null && st.currentBufferLatency < 400 ? "live" : ""));

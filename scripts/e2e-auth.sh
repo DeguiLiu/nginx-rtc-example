@@ -74,12 +74,6 @@ print(sig)
 # created a session per assertion. Returns the status only.
 play_status() {  # <t> <sign>
     local t="$1" sign="$2"
-    # auth.lua rate-limits /rtc/v1/play/ per client IP (0.5 req/s, burst 5) and
-    # this guard runs from the same address as everything else, so asserting
-    # faster than the bucket refills gets 429 instead of the 403 under test --
-    # and it would spend a real viewer's allowance. One request per 2s stays
-    # inside the sustained rate.
-    sleep 2
     python3 - "$STREAM" "$t" "$sign" <<'PY' >/tmp/e2e-auth-body.json
 import json, sys
 stream, t, sign = sys.argv[1:4]
