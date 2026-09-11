@@ -95,7 +95,14 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 | 1935 RTMP | 推流 + HTTP-FLV 源 |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
-鉴权统一 HMAC token：`t`=过期秒，`sign`=base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`))。演示 secret：`demo-secret-0123456789abcdef0123456789abcdef`。每流 secret 见 `deploy/nginx/conf/stream_keys.lua`。
+鉴权统一 HMAC token：`t`=过期秒，`sign`=base64url(HMAC-SHA256(`<app>/<stream>|t=<t>`))。**每流两把 secret**（`deploy/nginx/conf/stream_keys.lua`），用哪把取决于 token 的用途：
+
+| 键 | 谁在用 | 会下发给客户端吗 |
+|---|---|---|
+| `<app>/<stream>\|play` | `/rtc/v1/play/`、`/live`（HTTP-FLV） | 会 —— 内嵌在 `rtcplayer.html` 里，按公开信息对待 |
+| `<app>/<stream>\|publish` | RTMP `on_publish`、`/whip/endpoint` | 不会 |
+
+演示值：play `demo-secret-0123456789abcdef0123456789abcdef`，publish `push-secret-9f8e7d6c5b4a39281706f5e4d3c2b1a0`。用 play secret 推流会被拒（403）——这正是拆开的目的：能打开播放页的人就拿到了 play secret。
 
 ### 录制
 

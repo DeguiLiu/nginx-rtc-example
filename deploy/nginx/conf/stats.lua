@@ -3,6 +3,8 @@
 -- `rtc_stats` lua_shared_dict every second, so each request reads shared memory
 -- directly and never fires an internal subrequest.
 
+local ngx = ngx
+
 local dict = ngx.shared.rtc_stats
 
 local limit_req = require "resty.limit.req"

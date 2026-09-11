@@ -2,6 +2,7 @@
 -- Key lookup goes through the dynamic config module (lua_shared_dict), so keys
 -- can be hot-updated without nginx reload. Maps to the patent's "manage HTTP
 -- requests that create WebRTC sessions".
+local ngx = ngx
 local cjson = require "cjson"
 local config = require "config"
 
@@ -40,6 +41,20 @@ end
 ngx.req.read_body()
 local body = ngx.req.get_body_data()
 if not body then
+    -- get_body_data() returns nil for two very different requests: one with no
+    -- body at all, and one nginx spilled to a temp file because it exceeded
+    -- client_body_buffer_size. The module caps signaling bodies (rtc_max_sdp_len,
+    -- itself clamped to that buffer), so the second case is always an oversized
+    -- offer -- and answering it "no request body" sends the caller hunting for a
+    -- missing field instead of looking at the size.
+    if ngx.req.get_body_file() then
+        ngx.log(ngx.WARN, "rtc_auth: request body spilled to disk; raise "
+                          .. "client_body_buffer_size and rtc_max_sdp_len")
+        ngx.status = 413
+        ngx.header.content_type = "application/json"
+        ngx.say('{"code":413,"message":"request body too large"}')
+        return ngx.exit(413)
+    end
     ngx.log(ngx.INFO, "rtc_auth: no request body")
     return ngx.exit(400)
 end

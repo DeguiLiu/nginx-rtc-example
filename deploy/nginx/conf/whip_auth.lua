@@ -12,6 +12,7 @@
 -- "<api>/whip/endpoint?app=<app>&stream=<stream>", so a caller appends
 -- "&t=..&sign=.." into WHIP_STREAM and the client needs no token awareness.
 -- Give it a real flag once that file is not being edited concurrently.
+local ngx = ngx
 local config = require "config"
 
 local app = ngx.var.arg_app
