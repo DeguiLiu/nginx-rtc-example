@@ -14,12 +14,10 @@ ffmpeg/WHIP → nginx (RTMP/HTTP) → module (bridge → shm media ring → SRTP
 
 Both player pages below run against the same live stream; the wall clock burned into the top-left corner is what makes the latency difference readable at a glance:
 
-| HTTP-FLV (`/flvplayer`) | WebRTC (`/rtcplayer.html`) |
-|---|---|
-| ![HTTP-FLV player](docs/images/HTTP-FLV.png) | ![WebRTC player](docs/images/webrtc.png) |
+![HTTP-FLV (`/flvplayer`) on the left, WebRTC (`/rtcplayer.html`) on the right](docs/images/webrtc-vs-http-flv.png)
 
-<!-- docs/images/webrtc.png is still a generated placeholder. Drop the real
-     /rtcplayer.html capture in at the same path and this table needs no edit. -->
+<!-- One capture, both real pages side by side: the right pane is a live
+     /rtcplayer.html, so the two burned-in clocks are directly comparable. -->
 
 ## Repos
 
