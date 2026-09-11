@@ -60,6 +60,7 @@
 - 解析 RTP 分片时,续片没有前置起始片(丢包 / 中途接入)要丢弃,不要 `concat(nil, ...)` ——
   崩溃点恰好落在该工具要观测的丢包场景上(`client/dump.mjs` 的 FU-A 分支)。
 
-**未修,需单独决策**:HMAC secret 硬编码在三处可执行文件(`run.sh:34`、`play.mjs:6`、
-`dump.mjs:104`),且与 `deploy/nginx/conf/stream_keys.lua` 同值。去掉默认值会让 `./run.sh push` 与
-`client/play.mjs` 在没有外部注入时不可用,属于使用方式的改变。
+**未修,需单独决策**:HMAC secret 硬编码在可执行文件(`run.sh:34`、`client/lib/token.mjs` 的 `DEMO_KEY`),
+且与 `deploy/nginx/conf/stream_keys.lua` 同值。**签名算法本身已收敛到 `client/lib/token.mjs` 一处**
+(此前 play/dump/probe 各写一份,消息格式抄错一处就是 403);收敛的是算法与默认值,不是 secret 的存在。
+去掉默认值会让 `./run.sh push` 与 `client/play.mjs` 在没有外部注入时不可用,属于使用方式的改变。

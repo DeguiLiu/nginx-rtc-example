@@ -32,7 +32,7 @@ vendor/                 依赖说明（不内嵌源码，唯一内嵌三方资�
 deploy/nginx/
   conf/                 nginx.conf + *.lua（HMAC 鉴权、stats、flvplayer、观众计数）
   html/                 rtcplayer.html / flv.min.js（flv.js v1.6.2）/ hmac-sha256.js
-client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）
+client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）、lib/token.mjs（HMAC）
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
 docs/                   设计、评估、实现指南、nginx 编程规范（中文）
   images/               README 截图
@@ -82,7 +82,7 @@ OPENRESTY_PREFIX=$PWD/build/nginx scripts/build-openresty.sh
 OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 ./run.sh push          # ffmpeg 推 livestream（左上角烧北京秒表，便于目测延迟）
 ./run.sh keep-push     # 保活推流，ffmpeg 退出自动重启
-./run.sh verify        # node client/play.mjs 冒烟播放
+./run.sh verify        # node client/play.mjs 冒烟播放（play.mjs 的参数原样透传）
 ./run.sh stop
 ```
 

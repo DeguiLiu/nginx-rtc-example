@@ -32,7 +32,7 @@ vendor/                 dependency notes (no embedded source, except one runtime
 deploy/nginx/
   conf/                 nginx.conf + *.lua (HMAC auth, stats, flvplayer, viewer count)
   html/                 rtcplayer.html / flv.min.js (flv.js v1.6.2) / hmac-sha256.js
-client/                 play.mjs (play), whip_push.mjs (WHIP push)
+client/                 play.mjs (play), whip_push.mjs (WHIP push), lib/token.mjs (HMAC)
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
 docs/                   design, evaluation, implementation guides, nginx coding standards (Chinese)
   images/               README screenshots
@@ -83,7 +83,7 @@ OPENRESTY_PREFIX=$PWD/build/nginx scripts/build-openresty.sh
 OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync config + start
 ./run.sh push          # ffmpeg pushes livestream (Beijing wall clock burned in for latency eyeballing)
 ./run.sh keep-push     # supervised push, auto-restarts ffmpeg
-./run.sh verify        # node client/play.mjs smoke playback
+./run.sh verify        # node client/play.mjs smoke playback (any play.mjs flag passes through)
 ./run.sh stop
 ```
 
