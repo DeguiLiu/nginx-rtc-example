@@ -1,7 +1,7 @@
-# ngx-rtc-module 多 worker 共享内存方案设计
+# nginx-rtc-module 多 worker 共享内存方案设计
 
 > 结论先行。本文给出多 worker 痛点、三种方案对比、共享数据结构设计、媒体数据分布、跨 worker 唤醒机制与实现分解。
-> 所有 nginx 源码行号基于 `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/`，
+> 所有 nginx 源码行号基于 `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/`，
 > 模块代码基于 `/home/dgliu/workspace/webrtc/nginx-rtc-module/`。
 >
 > **实现说明**：采用「双 registry 镜像」方案（见 0.4），与本文第 4 节原始「单一 registry + 私有扩展」
@@ -27,7 +27,7 @@
    由目标 worker 消费并做 per-session SRTP 加密发送。零拷贝到 socket 不可能——SRTP 每 session 密钥不同、
    必须就地变换，因此「每 worker 一份明文拷贝」是理论下界。
 4. **跨 worker 唤醒不能用 `ngx_notify`**：`ngx_notify` 是**进程内** eventfd
-   （`ngx_epoll_module.c:386-430`），只能唤醒本 worker。跨 worker 唤醒用 **master 在 fork 前创建的
+   （`ngx_epoll_module.c:386-428`），只能唤醒本 worker。跨 worker 唤醒用 **master 在 fork 前创建的
    per-worker eventfd 数组**（所有 worker 继承全部 fd，可互写），fd 号存入 shm；写环后写 8 字节唤醒目标 worker。
 5. **全程只改模块，不改 nginx/http-flv 源码**，最小改动。
 6. **封装模板**：source/session 注册表照搬 `ngx_http_limit_req_init_zone` 三段式 zone 初始化 + 全局
@@ -48,7 +48,7 @@
 
 - **改动最小**：不重构媒体热路径与 session 生命周期，只增 shm 层，http/stream/bridge 各加几处同步。
 - **单 worker 可逐步演进**：`ngx_rtc_core_get_conf()->sh == NULL`（未配 `rtc_zone`，函数本身仍返回非 NULL 的 conf）时走原进程内路径，功能不回退。
-- **媒体热路径不跨 shm**：每帧不碰 shm 锁，避免把全局自旋锁引入每帧发送。
+- **媒体热路径不跨 shm（同 worker）**：同 worker 每帧不碰 shm 锁；跨 worker 观众存在时 per-source 重传环 append 逐包取 `pool->mutex`（见 4.3、7.3），避免把全局自旋锁引入同 worker 每帧发送。
 
 代价：SSRC/PT/seq/SPS/PPS 等元数据出现「进程内 + shm」两份，需手工保持一致；媒体环（`ngx_rtc_shm_ring_t`，
 Phase 2 已落地，见 5、7.2）的生产/消费两端仍各自持有进程内 source/session，shm 骨架只负责身份与订阅关系，
@@ -66,7 +66,7 @@ Phase 2 已落地，见 5、7.2）的生产/消费两端仍各自持有进程内
 - session：全局 `ngx_queue_t` 链表 + `ngx_rbtree`（key = ICE ufrag），`ngx_rtc_session_find()` 按 ufrag 查找；
 - subscriber：每 source 一个 `ngx_queue_t`。
 
-session 由 `ngx_rtc_http_module.c` 用 `ngx_alloc` 分配，跨 HTTP 请求存活。部署配置
+session 由 `ngx_rtc_http_module.c` 用 `ngx_calloc` 分配，跨 HTTP 请求存活（`ngx_rtc_http_module.c:790`）。部署配置
 `openresty-rtmp-new/nginx/conf/nginx.conf` 曾显式 `worker_processes 1;`，注释写明「RTC source/session 注册表是每进程的」。
 
 > 多 worker 方案下 `ngx_rtc_core.c/h` 的进程内注册表**仍然保留**，作为媒体平面（封装/GOP/SRTP/RTCP）的
@@ -87,18 +87,18 @@ session 由 `ngx_rtc_http_module.c` 用 `ngx_alloc` 分配，跨 HTTP 请求存�
 1. **source 注册表**：HTTP worker 第一次 play 时创建 source 并分配 SSRC/PT，RTMP worker 收帧时若查不到同一
    source，会重复创建并分配另一套 SSRC/PT，导致 SDP 与 RTP 不一致，浏览器解码失败。
 2. **session 注册表**：HTTP worker 生成 ufrag 写入 SDP answer，但 STUN/DTLS 报文落在 UDP worker，
-   后者 `ngx_rtc_session_find(ufrag)` 必须能找到 HTTP worker 创建的 session（`ngx_rtc_stream_module.c:192`）。
+   后者 `ngx_rtc_session_find(ufrag)` 必须能找到 HTTP worker 创建的 session（`ngx_rtc_stream_module.c:561`）。
 3. **SSRC/seq/ts 计数器**：SSRC/PT 由 HTTP 分配、RTMP 使用；`video_seq` 每发一包自增。若 RTMP 推流重连落到
    不同 worker，seq 必须连续，否则 RTP 流断流、需重新关键帧。
 4. **GOP/序列头缓存（SPS/PPS/ASC）**：RTMP worker 解析 AVCDecoderConfigurationRecord 缓存 SPS/PPS
-   （`ngx_rtmp_rtc_bridge_module.c:147-194`），IDR 前要 STAP-A 前置；推流重连换 worker 后若缓存丢失，
+   （`ngx_rtmp_rtc_bridge_module.c:771-826`，`ngx_rtmp_rtc_parse_avc_header`），IDR 前要 STAP-A 前置；推流重连换 worker 后若缓存丢失，
    新订阅者无法起播。
 5. **订阅关系与就绪标志**：`source->subscribers` 链表和 `sess->srtp_ready` 是 RTMP worker 判断
    「给谁发、往哪个 worker 发」的唯一依据。
 
 ### 1.3 不能跨 worker 的状态（必须留私有）
 
-`ngx_rtc_session_s` 内嵌了不可跨进程的句柄/指针（`ngx_rtc_core.h:22-42`）：
+`ngx_rtc_session_s` 内嵌了不可跨进程的句柄/指针（`ngx_rtc_core.h:202-338`）：
 
 | 字段 | 类型 | 为何不能进 shm |
 |------|------|---------------|
@@ -116,8 +116,8 @@ scratch/转码器），shm 骨架只存跨 worker 必需的身份/PT/就绪/订�
 
 `rtc_zone` 指令 + `ngx_rtc_core_module`（NGX_CORE_MODULE）+ slab zone 三段式初始化（`ngx_rtc_core_init_zone`，
 照 limit_req 模板）已从 `ngx_rtc_shm.c` 拆到 `src/ngx_rtc_core_module.c`；`ngx_rtc_shm.c` 现为纯数据结构
-注册表，不感知 nginx config 与模块身份（因此可被 host 单测编译，见 7.0），只定义 `ngx_rtc_shm_ctx_t`
-与 source/session 骨架。shm 内两类骨架：
+注册表，不感知 nginx config 与模块身份（因此可被 host 单测编译，见 7.0），只定义 `ngx_rtc_shm_ctx_t`、
+source/session 骨架与媒体环/重传环。shm 内两类骨架：
 
 | shm 结构 | 内容 | 关联方式 |
 |---------|------|---------|
@@ -147,13 +147,13 @@ flowchart LR
 
 同步点（glue 层）：
 
-- **http**：SSRC/PT 权威在 shm（先 `ngx_rtc_shm_source_get`，`video_ssrc==0` 才分配并写回 shm）；
+- **http**：SSRC/PT 权威在 shm（`ngx_rtc_shm_source_get` 首次创建 source 时随机分配 SSRC/PT 并写 shm，已有 source 直接读回）；
   play 时 `ngx_rtc_shm_session_add` 加 session 骨架。
 - **stream**：STUN 进程内查不到时 `ngx_rtc_stream_attach_from_shm` 从 shm 重建私有 session
   （alloc + 拷 ufrag/pwd + fsm init + 重建 source）；DTLS done 时更新 shm（`srtp_ready=1`、
   `owner_slot=ngx_worker`、subscribe）；close 时仅 `owner_slot==-1`（半开）或 `owner_slot==ngx_worker` 才删 shm 骨架。
-- **bridge**：`ngx_rtmp_rtc_sync_shm` 从 shm 同步 SSRC/PT（推流先来则分配写 shm）；
-  close_stream 同步 shm `publishing=0` + remove。
+- **bridge**：`ngx_rtmp_rtc_sync_shm` 从 shm 同步 SSRC/PT（shm source 不存在时不镜像，出现后由 claim 读回）；
+  发布关闭（AMF_CMD/deleteStream 的 teardown 路径，非 `close_stream` 钩子）经 `ngx_rtc_publish_release` 同步 shm `publishing=0` + remove。
 
 ---
 
@@ -166,7 +166,7 @@ flowchart LR
 | 分配器 | `ngx_slab_pool`（小对象免碎片、`_locked` 变体） | 自己写 free-list/伙伴算法 | 不需要 |
 | 锁 | `ngx_shmtx` 自旋锁 + POSIX sem 睡眠回退 | 自己写锁 | 不需要 |
 | reload/二进制升级 | `shm.exists` + `oshm_zone->data` 续用，官方路径 | 完全自己处理重映射 | 不需要 |
-| 地址一致性 | nginx 强制各进程映射同地址（`ngx_cycle.c:1002` 校验），可直接存裸指针 | 自己保证 | 无关 |
+| 地址一致性 | nginx 强制各进程映射同地址（`ngx_cycle.c:1003` 校验），可直接存裸指针 | 自己保证 | 无关 |
 | 媒体分发 | 同 zone 里划 ring 或额外 slab 大块 | 自定义 ring | 每 worker 重新投递（内核拷贝 + 序列化） |
 | 跨机器扩展 | 无 | 无 | 天然支持（relay） |
 | 工作量/风险 | 低，全部复用 nginx 原生 | 高，重造 slab+锁+生命周期 | 中，但媒体路径每帧多 syscall、延迟和 CPU 差 |
@@ -179,7 +179,7 @@ flowchart LR
    source/session 都是几百字节的小对象，slab 完美匹配。
 2. `ngx_shmtx_lock`（`src/core/ngx_shmtx.c:70`）自带「多核自旋 + 单核 yield + POSIX sem 睡眠」退化，
    临界区按 nginx 约定「短促」即可，官方模块证明可用。
-3. `ngx_shared_memory_add`（`src/core/ngx_cycle.c:1312`）与 `shm_zone->init`（`src/core/ngx_cycle.c:973`
+3. `ngx_shared_memory_add`（`src/core/ngx_cycle.c:1313`）与 `shm_zone->init`（`src/core/ngx_cycle.c:973`
    `ngx_init_zone_pool`）自动处理 mmap、地址一致性、reload 续用，我们只需按
    `ngx_http_limit_req_init_zone` 的握手模板写一个 init 回调。
 4. 方案 B 除了自由度高没有任何收益，且要重做 `ngx_slab_pool_t` 已提供的全部能力，违背「最小改动」。
@@ -197,7 +197,7 @@ OpenResty `lua_shared_dict`，见第 3 节。
 
 ## 3. 借鉴 OpenResty lua_shared_dict 封装
 
-OpenResty 的 `lua_shared_dict`（`/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/ngx_lua-0.10.31rc5/src/ngx_http_lua_shdict.c`）
+OpenResty 的 `lua_shared_dict`（`/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/ngx_lua-0.10.31rc5/src/ngx_http_lua_shdict.c`）
 是 nginx 生态里规模最大、被验证最多的「跨 worker 键值存储」，其结构与本模块 source/session 注册表高度同构：
 **key = source 名 / session ufrag，value = 对应元数据**。以下逐项对照并给出本模块的推荐封装。
 
@@ -226,14 +226,14 @@ OpenResty 的 `lua_shared_dict`（`/home/dgliu/workspace/webrtc/openresty-1.31.1
 任何进程都能经 `shm_zone->shm.addr` 上的 `ngx_slab_pool_t.data` 拿到同一张表。这比「静态全局变量指向 shm」
 更稳（本模块的 `ngx_rtc_shm_ctx_t` 同样存 `pool->data`）。
 
-slab 大小：指令配置的 zone 尺寸是**总尺寸**，`ngx_slab_init`（`src/core/ngx_slab.c:98-165`）先扣掉
+slab 大小：指令配置的 zone 尺寸是**总尺寸**，`ngx_slab_init`（`src/core/ngx_slab.c:99-165`）先扣掉
 slots/stats/pages 元数据，余下才可分配。故 `rtc_zone 32m` 实际可用小于 32m，估算时要留 slab 头部开销
 （约 1 页 + `n×sizeof(page)` + stats），详见 8.2。
 
 ### 3.3 锁粒度：全局 mutex，不预先分片
 
 shdict 的所有操作（get/set/expire/lpush/lpop）都收敛到一把 `ngx_shmtx_lock(&ctx->shpool->mutex)`
-（如 `ngx_http_lua_shdict.c:604,628,428,524`），临界区仅「rbtree 查/插 + slab 小对象分配/释放」，
+（如 `ngx_http_lua_shdict.c:604,779,428,524`），临界区仅「rbtree 查/插 + slab 小对象分配/释放」，
 几十~几百纳秒，未做分片。理由：写操作低频，读多写少，分片/每桶锁复杂度收益不成比例。
 
 本模块的分层结论（与 shdict 一致但更明确）：
@@ -352,7 +352,7 @@ rtc_zone rtc 32m;
 ```
 
 init 回调 `ngx_rtc_core_init_zone`（在 `ngx_rtc_core_module.c`）严格照搬 `ngx_http_limit_req_init_zone` 三段式
-（`src/http/modules/ngx_http_limit_req_module.c:642-707`）：
+（`src/http/modules/ngx_http_limit_req_module.c:699-761`）：
 
 1. `octx != NULL`（reload 有旧 data）：`ctx->sh = octx->sh; ctx->shpool = octx->shpool;`，随后
    `return ngx_rtc_shm_layout_check(ctx->sh, ...)`。
@@ -487,8 +487,9 @@ session 的 worker 才能写（`ngx_rtc_shm_session_set_state`）：守卫接受
   按 shm 快照重建进程内 session（alloc + 拷 ufrag/pwd/PT + fsm init + `ngx_rtc_source_get` 重建 source）。
 - DTLS done：`ngx_rtc_shm_session_activate` 写 shm（`srtp_ready=1`、`owner_slot=ngx_worker`、
   `state=SRTP_READY`、`expires=0`，非 publishing 才订阅 source）。
-- 生命周期状态：UDP handler 在 ICE 绑定 / DTLS 握手 / SRTP 就绪处调用 `ngx_rtc_stream_publish_state`
-  写 `state`；关闭路径不写（骨架直接被释放，没有 CLOSED tombstone）。
+- 生命周期状态：UDP handler 在 ICE 绑定 / DTLS 握手处调用 `ngx_rtc_stream_publish_state`
+  写 `state`；SRTP 就绪由 DTLS-done 路径的 `ngx_rtc_shm_session_activate` 写 `SRTP_READY`；
+  关闭路径不写（骨架直接被释放，没有 CLOSED tombstone）。
 - close：`ngx_rtc_shm_session_remove_if_owner` 仅在 `owner_slot == -1`（半开）或 `owner_slot == ngx_worker`
   时删除骨架，防止信令 worker 的僵尸进程内 session 被 reaper 关闭时误删活跃骨架。
 
@@ -628,7 +629,7 @@ shm 骨架继续承担身份与订阅关系，进程内结构继续承担媒体�
 ### 6.1 关键事实：`ngx_notify` 不能跨 worker
 
 `ngx_notify` 宏展开为 `ngx_event_actions.notify`（`src/event/ngx_event.h:411`），epoll 实现是写本进程的
-`notify_fd`（eventfd，`src/event/modules/ngx_epoll_module.c:386-430`）。它只唤醒**当前 worker 自己的事件循环**，
+`notify_fd`（eventfd，`src/event/modules/ngx_epoll_module.c:386-428`）。它只唤醒**当前 worker 自己的事件循环**，
 用于把耗时操作投递回本 worker。跨 worker 唤醒必须另建通道。
 
 ### 6.2 推荐：master fork 前创建 per-worker eventfd
@@ -643,12 +644,12 @@ shm 骨架继续承担身份与订阅关系，进程内结构继续承担媒体�
 ```c
 /* ngx_rtc_core_init_module（master, pre-fork） */
 for (w = 0; w < ccf->sh->nworkers; w++) {
-    ccf->sh->notify_fd[w] = eventfd(0, EFD_NONBLOCK);   /* 非 Linux 回退 pipe() */
+    ccf->sh->notify_fd[w] = eventfd(0, EFD_NONBLOCK);   /* 整段在 #ifndef _WIN32 内，Windows 不建 */
 }
 /* notify_fd[] 存于 shm ctx，worker fork 后继承 fd；reload 时先 close 旧 fd 再重建 */
 
 /* ngx_rtc_stream_init_process（worker） */
-ngx_add_event(notify_conn[ngx_worker].read, NGX_READ_EVENT, handler);
+ngx_add_event(&ngx_rtc_stream_notify_event, NGX_READ_EVENT, 0);
 /* handler: read(eventfd) 清计数 -> ngx_rtc_stream_drain_ring() */
 ```
 
@@ -682,7 +683,7 @@ uint64_t one = 1;
 
 - `src/ngx_rtc_shm.c` / `src/ngx_rtc_shm.h`：纯数据结构的 shm 注册表——`ngx_rtc_shm_ctx_t`、
   source/session 骨架、`ngx_rtc_shm_ring_t`、`ngx_rtc_shm_retransmit_t`、发布所有权三函数。
-  不感知 nginx config 与模块身份（头注释仍写「Phase 0/1」，实际媒体环与重传环均已落地）。
+  不感知 nginx config 与模块身份（源文件头注释仍写「Phase 0/1」，实际媒体环与重传环均已落地）。
 - `src/ngx_rtc_core_module.c`：`rtc_zone` 指令、`ngx_rtc_core_module`（NGX_CORE_MODULE）、
   `ngx_rtc_core_init_zone`（照 limit_req 三段式 + layout 校验）。拆分原因就是可测性：注册表要进 host
   sanitizer 单测，config/module 只能在 nginx 内运行。
@@ -693,13 +694,13 @@ uint64_t one = 1;
 
 ### 7.1 元数据上 shm，信令/绑定跨 worker 正确
 
-- `ngx_rtc_http_module.c`：SSRC/PT 权威在 shm（`ngx_rtc_shm_source_get`，`video_ssrc==0` 才分配写回）；
-  play 时 `ngx_rtc_shm_session_add` 加 session 骨架；进程内 session 仍 `ngx_alloc` 分配。
+- `ngx_rtc_http_module.c`：SSRC/PT 权威在 shm（`ngx_rtc_shm_source_get` 创建时随机分配，已有 source 读回）；
+  play 时 `ngx_rtc_shm_session_add` 加 session 骨架；进程内 session 仍 `ngx_calloc` 分配。
 - `ngx_rtc_stream_module.c`：STUN 进程内未命中时 `ngx_rtc_stream_attach_from_shm` 从 shm 重建私有 session；
   DTLS done 更新 shm（`srtp_ready=1`/`owner_slot=ngx_worker`/subscribe）；close 仅 `owner_slot==-1`
   或 `owner_slot==ngx_worker` 才删 shm 骨架（防 signaling worker 僵尸 session 被 reaper 误删活跃骨架）。
-- `ngx_rtmp_rtc_bridge_module.c`：`ngx_rtmp_rtc_sync_shm` 从 shm 同步 SSRC/PT（推流先来则分配写 shm）；
-  close_stream 同步 shm `publishing=0` + remove。
+- `ngx_rtmp_rtc_bridge_module.c`：`ngx_rtmp_rtc_sync_shm` 从 shm 同步 SSRC/PT（shm source 不存在时不镜像，出现后由 claim 读回）；
+  发布关闭（AMF_CMD/deleteStream 的 teardown 路径，非 `close_stream` 钩子）经 `ngx_rtc_publish_release` 同步 shm `publishing=0` + remove。
 - **设计取舍**：未采用「session/source 拆 shm 骨架 + worker 私有扩展」的单一 registry，而是双 registry 镜像
   （见 0.4、1.4）。媒体热路径仍在进程内，信令→绑定→订阅的跨 worker 一致性由 shm 保证。
   验收：HTTP 与 UDP 分属不同 worker 时，STUN 能找到 session、DTLS 能完成。
@@ -736,17 +737,17 @@ uint64_t one = 1;
 
 | 主题 | 文件与行号 |
 |------|-----------|
-| slab 分配器 `_locked` / free | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_slab.c:184,461` |
+| slab 分配器 `_locked` / free | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_slab.c:184,461` |
 | slab 大块整页分配 | 同上 `:191-206` |
-| shmtx 自旋 + sem 睡眠回退 | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_shmtx.c:70-133` |
-| mmap 共享内存 | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/os/unix/ngx_shmem.c:14-28` |
-| `ngx_shared_memory_add` / zone 结构 | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_cycle.c:1312` |
-| zone pool 初始化与地址一致性校验 | 同上 `:973-1035`（`:1002` 报「no equal addresses」） |
-| master/worker `init_process` 时机 | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_cycle.c:652`；`src/os/unix/ngx_process_cycle.c:967` |
-| `ngx_notify` 定义与 epoll eventfd 实现 | `src/event/ngx_event.h:411`；`src/event/modules/ngx_epoll_module.c:386-430` |
-| master↔worker socketpair channel | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/os/unix/ngx_process.c:125` |
-| limit_req zone init 握手模板 | `/home/dgliu/workspace/webrtc/openresty-1.31.1.1/bundle/nginx-1.31.1/src/http/modules/ngx_http_limit_req_module.c:642-707` |
-| nginx-rtmp 引用计数链（非跨 worker） | `/home/dgliu/workspace/webrtc/nginx-http-flv-module/ngx_rtmp_shared.c:12-126` |
+| shmtx 自旋 + sem 睡眠回退 | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_shmtx.c:70-133` |
+| mmap 共享内存 | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/os/unix/ngx_shmem.c:14-28` |
+| `ngx_shared_memory_add` / zone 结构 | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_cycle.c:1313` |
+| zone pool 初始化与地址一致性校验 | 同上 `:973-1035`（`:1003` 报「no equal addresses」） |
+| master/worker `init_process` 时机 | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/core/ngx_cycle.c:652`；`src/os/unix/ngx_process_cycle.c:967` |
+| `ngx_notify` 定义与 epoll eventfd 实现 | `src/event/ngx_event.h:411`；`src/event/modules/ngx_epoll_module.c:386-428` |
+| master↔worker socketpair channel | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/os/unix/ngx_process.c:125` |
+| limit_req zone init 握手模板 | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/openresty-1.31.1.1/bundle/nginx-1.31.1/src/http/modules/ngx_http_limit_req_module.c:699-761` |
+| nginx-rtmp 引用计数链（非跨 worker） | `/home/dgliu/workspace/webrtc/nginx-rtc-example/build/src/nginx-http-flv-module/ngx_rtmp_shared.c:12-126` |
 | 现有进程内注册表（保留，媒体平面主用） | `/home/dgliu/workspace/webrtc/nginx-rtc-module/src/ngx_rtc_core.c` |
 | 进程内 source/session 完整结构 | `/home/dgliu/workspace/webrtc/nginx-rtc-module/src/ngx_rtc_core.h` |
 | shm 注册表（骨架/环/重传/所有权） | `/home/dgliu/workspace/webrtc/nginx-rtc-module/src/ngx_rtc_shm.c`、`ngx_rtc_shm.h` |
