@@ -117,9 +117,11 @@ nginx.exe -p .
 
 现状：**协议核心交叉已走通**（`nginx-rtc-module/scripts/cross-win64-tests.sh` 出 `run_tests.exe`）；**完整 `nginx.exe` 交叉构建尚未闭环**，卡在 `lua-resty-signal` 的 `SIGURG` 未定义（见“已知限制”）。下面的补丁与 configure 参数来自一次成功的现场，重跑前先补上 `SIGURG` 守卫。
 
+那次构建的现场记录（`/tmp` 树与日志清单、逐条原始命令）归档在 `docs/archive/win64-linux-crossbuild-notes.md`；下节的补丁与 configure 参数即由它整理而成，遇到本节没写到的细节可回到那份记录。
+
 ### 补丁（必须落在 `bundle/`，只改 `build/` 下次 configure 会被覆盖）
 
-1. **windres wrapper**：已固化在 `scripts/win64-windres-wrapper.sh`——给 `windres` 补 `-D_WIN32` 与 MinGW include 路径（否则 OpenSSL 的 `.rc` 找不到 `winver.h`）。另需手工把 `x86_64-w64-mingw32-gcc-posix` 软链成无后缀的 `x86_64-w64-mingw32-gcc` 供 configure 调用（wrapper 脚本本身不建这个软链；其注释提到的 `scripts/build-win64-linux.sh` 并不存在，完整流程目前仍是手工步骤）。
+1. **windres wrapper**：已固化在 `scripts/win64-windres-wrapper.sh`——给 `windres` 补 `-D_WIN32` 与 MinGW include 路径（否则 OpenSSL 的 `.rc` 找不到 `winver.h`）。另需手工把 `x86_64-w64-mingw32-gcc-posix` 软链成无后缀的 `x86_64-w64-mingw32-gcc` 供 configure 调用（wrapper 脚本本身不建这个软链；脚本注释指向本指南，完整流程目前仍是手工步骤）。
 2. **LuaJIT 交叉目标**：`bundle/LuaJIT-*/Makefile` 的 `TARGET_SYS?= $(HOST_SYS)` 会把交叉构建误判为宿主，改为 `TARGET_SYS= Windows`。
 3. **LuaJIT 安装分支**：OpenResty `configure` 中 LuaJIT 安装分 `msys` 与 `else` 两支，交叉构建走 `else` 会去找宿主的 `src/luajit` 并报 `install: 对 'luajit' 调用 stat 失败`。把 LuaJIT 安装段内两处 `if ($platform eq 'msys')` 改为 `if ($platform eq 'msys' || $ENV{'NGX_RTC_CROSS_WIN32'})`，用 `NGX_RTC_CROSS_WIN32=1` 触发。LuaJIT 产物 `build/LuaJIT-*/src/{luajit.exe,lua51.dll,libluajit-5.1.dll.a}` 本身是齐的。
 4. **LuaJIT 宿主工具**：configure 的 LuaJIT 编译行需 `HOST_CC=/usr/bin/gcc HOST_SYS=Linux TARGET_SYS=Windows`，否则 buildvm 无法在 Linux 上运行。

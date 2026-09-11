@@ -3,8 +3,9 @@
 #
 # windres does not inherit gcc's include search path and does not define _WIN32,
 # so compiling OpenSSL's .rc resource file fails with a missing winver.h. The
-# cross build installs this wrapper as `windres` ahead of the real tool
-# (see scripts/build-win64-linux.sh, step 1).
+# cross build installs this wrapper as `windres` ahead of the real tool; the
+# steps live in docs/windows-mingw-build-guide.md under "Linux MinGW 交叉编译",
+# and are still run by hand -- there is no build-win64-linux.sh in this repo.
 #
 # Recovered verbatim from the 2026-09-10 cross build (/tmp/winbin/windres).
 
