@@ -1,12 +1,12 @@
 // dump.mjs - connect with werift, reassemble the H264 RTP payload into an
 // Annex-B .h264 file so ffprobe/ffplay can verify the bitstream is intact.
 import { RTCPeerConnection, useH264, useOPUS } from "werift";
-import { createHmac } from "node:crypto";
 import { openSync, writeSync, closeSync } from "node:fs";
+
+import { DEMO_KEY, signToken, streamPathOf } from "./lib/token.mjs";
 
 const API = "http://127.0.0.1:18082/rtc/v1/play/";
 const STREAM = process.argv[2] || "webrtc://127.0.0.1:18082/live/livestream";
-const STREAM_PATH = STREAM.replace(/^rtc:\/\/|^webrtc:\/\//, "").replace(/^[^/]+\//, "");
 const OUT = process.argv[3] || "/tmp/dump.h264";
 
 // stdout via writeSync: console.log is asynchronous when stdout is a pipe, so
@@ -100,12 +100,8 @@ async function main() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // HMAC token: t = expiry (unix s), sign = base64url(HMAC-SHA256(app/stream|t=t)).
-    const KEY = "demo-secret-0123456789abcdef0123456789abcdef";
-    const t = Math.floor(Date.now() / 1000) + 3600;
-    const sign = createHmac("sha256", KEY)
-      .update(`${STREAM_PATH}|t=${t}`)
-      .digest("base64url");
+    // HMAC token over the stream path; see client/lib/token.mjs.
+    const { t, sign } = signToken(DEMO_KEY, streamPathOf(STREAM));
 
     const res = await fetch(API, {
       method: "POST",
