@@ -69,12 +69,22 @@ local MAX_TOKEN_TTL = 7200
 -- HMAC token 校验: secret 存 shared dict, t=过期 unix 秒, sign=base64url(HMAC-SHA256).
 -- purpose 缺省为 "play" —— 观看是最常见的调用方, 而推流必须显式声明, 免得新
 -- 加的 ingest 路径忘记传参就静默拿到观看侧权限。
-function _M.verify(appstream, t, sign, purpose)
+
+-- Server-side read of one stream secret out of the hot-reloaded shared dict.
+-- The pull manager (conf/rtsp_pull.lua) needs the publish secret to mint its own
+-- ingest token; nothing that runs on behalf of a client may call this. Same
+-- purpose table as verify(), so an unknown purpose is refused rather than
+-- interpolated into a key nobody defined.
+function _M.secret(appstream, purpose)
     local suffix = SUFFIX[purpose or "play"]
     if not suffix then
-        return false
+        return nil, "purpose must be play or publish"
     end
-    local secret = shared:get(appstream .. suffix)
+    return shared:get(appstream .. suffix)
+end
+
+function _M.verify(appstream, t, sign, purpose)
+    local secret = _M.secret(appstream, purpose)
     if not secret or "string" ~= type(secret) then
         return false
     end
