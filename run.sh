@@ -40,6 +40,12 @@ PUSH_KEY="${PUSH_KEY:-push-secret-9f8e7d6c5b4a39281706f5e4d3c2b1a0}"
 PLAY_KEY="${PLAY_KEY:-demo-secret-0123456789abcdef0123456789abcdef}"
 KEEP_PID=/tmp/rtc_keep_push.pid   # pid of keep-push supervisor, for stop()
 KEEP_TC_PID=/tmp/rtc_keep_tc.pid  # pid of keep-transcode supervisor, for stop()
+# argv[0] marker of the push ffmpeg. Process cleanup matches this marker rather
+# than `pkill -x ffmpeg`: this host also runs ffmpeg processes that are none of
+# this script's business (another worktree's instance, an operator's own
+# capture), and `-x ffmpeg` matches those by comm just as well as our own --
+# which is how `run.sh stop` used to take a stranger's encoder down with it.
+PUSH_MARK=rtc-push-marker
 
 # Multi-resolution ladder (srs-demo parity): source stays untouched, each
 # rung is an independent RTMP stream transcoded from the source loopback.
@@ -142,13 +148,19 @@ start_push() {
     # pure VBR: an ultrafast I-frame spikes far above the ~2.1 Mbps average and
     # overruns the path -- measured as ~52% loss on the original stream while
     # the CBR-capped transcode rungs on the same link stayed at 0%.
-    TZ=Asia/Shanghai ffmpeg -re -f lavfi -i testsrc2=size=640x360:rate=30 \
-        -f lavfi -i sine=frequency=1000:sample_rate=48000 \
-        -vf "$vf_clk" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -bf 0 -pix_fmt yuv420p \
-        -maxrate 2500k -bufsize 1000k \
-        -c:a aac -b:a 64k -ar 48000 \
-        -f flv "rtmp://127.0.0.1:1935/live/livestream?t=${exp}&sign=${sign}"
+    # A subshell around `exec -a`, exactly like the transcode child below: the
+    # supervisor's loop has to survive (exec would replace it), and the marker
+    # in argv[0] is what lets push_running()/stop() address this ffmpeg alone.
+    (
+        TZ=Asia/Shanghai exec -a "$PUSH_MARK" ffmpeg \
+            -re -f lavfi -i testsrc2=size=640x360:rate=30 \
+            -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+            -vf "$vf_clk" \
+            -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -bf 0 -pix_fmt yuv420p \
+            -maxrate 2500k -bufsize 1000k \
+            -c:a aac -b:a 64k -ar 48000 \
+            -f flv "rtmp://127.0.0.1:1935/live/livestream?t=${exp}&sign=${sign}"
+    )
 }
 
 # Transcode the source stream into each ladder rung. One ffmpeg, N outputs:
@@ -191,24 +203,17 @@ start_transcode() {
     ffmpeg "${args[@]}"
 }
 
-# `pgrep -x ffmpeg` matches the TRANSCODE ffmpeg too -- `exec -a` rewrites
-# argv[0] but not /proc/<pid>/comm -- so keep-push concluded "an ffmpeg is
-# alive" and never respawned a dead push. Identify the push by the cmdline of
-# an actual ffmpeg process instead.
+# Identify the push by its argv[0] marker. Not `pgrep -x ffmpeg`: that matches
+# the transcode child and every foreign ffmpeg on the host (comm stays "ffmpeg"
+# for all of them), and never this push's replacement after `exec -a`.
 push_running() {
-    local p
-    for p in $(pgrep -x ffmpeg); do
-        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "testsrc2"; then
-            return 0
-        fi
-    done
-    return 1
+    pgrep -f "$PUSH_MARK" >/dev/null
 }
 
 keep_push() {
     echo "[keep-push] supervising ffmpeg push (pid $$)"
     echo "$$" > "$KEEP_PID"
-    trap 'rm -f "$KEEP_PID"; pkill -x ffmpeg 2>/dev/null || true' EXIT
+    trap 'rm -f "$KEEP_PID"; pkill -f "$PUSH_MARK" 2>/dev/null || true' EXIT
     while true; do
         if ! push_running; then
             start_push || true
@@ -314,9 +319,9 @@ stop_supervisor() {   # name pidfile
         return 0
     fi
     kill "$pid" 2>/dev/null || true
-    # Wait for it to actually exit before the caller pkill's ffmpeg: a
-    # supervisor that is still looping only sees a missing ffmpeg and respawns
-    # one, leaving a publisher alive after `stop` returns.
+    # Wait for it to actually exit before the caller kills the ffmpeg it
+    # spawned: a supervisor that is still looping only sees a missing ffmpeg
+    # and respawns one, leaving a publisher alive after `stop` returns.
     for i in {1..25}; do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.2
@@ -328,10 +333,13 @@ stop_supervisor() {   # name pidfile
 stop() {
     stop_supervisor keep-push "$KEEP_PID"
     stop_supervisor keep-transcode "$KEEP_TC_PID"
+    # Mop up what a supervisor's own EXIT trap did not get (a foreground
+    # `run.sh push`/`transcode`, or a supervisor killed before its trap ran).
+    # Both are matched by marker, so nothing outside this script is affected.
     pkill -f "rtc-transcode-marker" 2>/dev/null || true
+    pkill -f "$PUSH_MARK" 2>/dev/null || true
     gen_nginx_conf 2>/dev/null || true
     "$ORX/sbin/nginx" -s stop -p "$ORX" -c conf/nginx.rtc.conf 2>/dev/null || true
-    pkill -x ffmpeg 2>/dev/null || true
 }
 
 case "${1:-}" in
