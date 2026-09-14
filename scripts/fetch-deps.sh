@@ -69,29 +69,5 @@ if [ ! -d "$CACHE/ngxtop/ngxtop" ]; then
         || echo "[warn] ngxtop not installed; 'run.sh ngxtop' needs it" >&2
 fi
 
-# mediamtx - the RTSP server scripts/e2e-rtsp-pull.sh publishes to, standing in
-# for the RS500 device so that guard exercises a real RTSP session instead of a
-# stub. A runtime tool, not a build input, so a failure here only warns.
-# Pinned by version AND sha256 (the checksum published by the release), fetched
-# through the mirror used for github on this host.
-MEDIAMTX_VER=v1.21.0
-MEDIAMTX_TAR="mediamtx_${MEDIAMTX_VER}_linux_amd64.tar.gz"
-MEDIAMTX_SHA=e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b
-if [ ! -x "$CACHE/mediamtx/mediamtx" ]; then
-    echo "[get ] $MEDIAMTX_TAR ($MEDIAMTX_VER)"
-    if curl -fsSL "https://ghfast.top/https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VER/$MEDIAMTX_TAR" \
-            -o "$CACHE/$MEDIAMTX_TAR"; then
-        if echo "$MEDIAMTX_SHA  $CACHE/$MEDIAMTX_TAR" | sha256sum -c - >/dev/null 2>&1; then
-            mkdir -p "$CACHE/mediamtx"
-            tar -xzf "$CACHE/$MEDIAMTX_TAR" -C "$CACHE/mediamtx" mediamtx
-        else
-            echo "[warn] mediamtx sha256 mismatch; e2e-rtsp-pull.sh cannot run" >&2
-            rm -f "$CACHE/$MEDIAMTX_TAR"
-        fi
-    else
-        echo "[warn] mediamtx not fetched; e2e-rtsp-pull.sh needs it" >&2
-    fi
-fi
-
 echo "[done] deps cached under $CACHE"
 ls -la "$CACHE"

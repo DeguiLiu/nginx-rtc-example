@@ -269,31 +269,21 @@ async function play() {
     el.btnPlay.disabled = true; el.btnStop.disabled = false;
     setState("信令协商中…", "warn");
 
-    // 按需拉流：空闲流的第一帧要靠这次播放请求唤起的 ffmpeg 才有，源还没建立时
-    // 服务端答 code!=0（无此源）。此时重试而不是直接失败——每次重试都重新签一份
-    // token，重试次数乘以间隔（约 6s）要留在上面 10s 的 fallback 计时之内。
-    const SIGNAL_ATTEMPTS = 8, SIGNAL_RETRY_MS = 800;
-    let data = null;
-    for (let attempt = 1; attempt <= SIGNAL_ATTEMPTS; attempt++) {
-      const tk = signToken(secret, app, stream, 3600);
-      const res = await fetch(api, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sdp: offer.sdp, streamurl, api, t: String(tk.t), sign: tk.sign }),
-      });
-      data = await res.json().catch(() => null);
-      if (!data) {
-        log(`信令返回非 JSON (HTTP ${res.status})`);
-        if (res.status === 429) log("被限流：播放请求过于频繁，等几秒再试");
-        else if (res.status === 403) log("鉴权失败：检查密钥是否正确");
-        else if (res.status === 400) log("请求被拒：SDP/流地址格式错误");
-        setState("信令失败 HTTP " + res.status, "err");
-        stop();
-        return;
-      }
-      if (data.code === 0) break;
-      log(`信令 code=${data.code}，等待拉流建立 (${attempt}/${SIGNAL_ATTEMPTS})`);
-      if (attempt < SIGNAL_ATTEMPTS) await new Promise(r => setTimeout(r, SIGNAL_RETRY_MS));
+    const tk = signToken(secret, app, stream, 3600);
+    const res = await fetch(api, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: offer.sdp, streamurl, api, t: String(tk.t), sign: tk.sign }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!data) {
+      log(`信令返回非 JSON (HTTP ${res.status})`);
+      if (res.status === 429) log("被限流：播放请求过于频繁，等几秒再试");
+      else if (res.status === 403) log("鉴权失败：检查密钥是否正确");
+      else if (res.status === 400) log("请求被拒：SDP/流地址格式错误");
+      setState("信令失败 HTTP " + res.status, "err");
+      stop();
+      return;
     }
     if (data.code !== 0) { log("信令错误: " + JSON.stringify(data)); setState("信令失败 code=" + data.code, "err"); stop(); return; }
     log(`[${Date.now()-t0}ms] 收到 answer SDP`);

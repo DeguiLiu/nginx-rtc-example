@@ -5,7 +5,6 @@
 local ngx = ngx
 local cjson = require "cjson"
 local config = require "config"
-local rtsp_pull = require "rtsp_pull"
 
 -- Log levels: server-side failures (limiter init / runtime) and authorization
 -- denials stay at ERR -- nginx's own auth_basic logs "user not found" /
@@ -94,11 +93,3 @@ if not config.verify(app .. "/" .. stream, req.t, req.sign, "play") then
             " t=", tostring(req.t), " sign=", tostring(req.sign))
     return ngx.exit(403)
 end
-
--- This stream is pulled from the RS500 on demand (conf/rtsp_pull.lua), and an
--- authorized play is what wakes it. Deliberately after the token check: a
--- request with a bad signature must not open an RTSP session on the device.
--- Calling it here rather than in the content phase keeps the pull's startup off
--- the signaling response path -- the first answer of an idle stream may still
--- come back "no source", which is why the player retries.
-rtsp_pull.demand(app .. "/" .. stream)
