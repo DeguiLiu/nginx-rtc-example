@@ -22,9 +22,9 @@
 # on 8555, and stops both on exit. Idle reclaim alone takes IDLE_SECONDS, so a
 # full run is minutes, not seconds.
 #
-# Teardown kills only what this script started. It deliberately avoids `run.sh
-# stop` there: that command's `pkill -x ffmpeg` would take an operator's unrelated
-# ffmpeg processes with it. Step 7 exercises `run.sh stop` on purpose, once.
+# Teardown kills only what this script started, and stops nginx through the
+# prefix's own pid file: the guard starts no push/transcode supervisor, so there
+# is nothing else of this repo's to bring down.
 #
 # Usage: scripts/e2e-rtsp-pull.sh   (OPENRESTY_PREFIX selects the nginx prefix)
 set -euo pipefail
@@ -52,11 +52,13 @@ LOG="$ORX/logs/error.log"
 
 MTX_PID=""
 PUB_PID=""
+FOREIGN_PID=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "[PASS] $*"; }
 
 cleanup() {
+    [ -n "$FOREIGN_PID" ] && kill "$FOREIGN_PID" 2>/dev/null || true
     [ -n "$PUB_PID" ] && kill "$PUB_PID" 2>/dev/null || true
     [ -n "$MTX_PID" ] && kill "$MTX_PID" 2>/dev/null || true
     if [ -f "$ORX/logs/nginx.pid" ]; then
@@ -390,8 +392,13 @@ grep -q "destroyed: torn down by" "$MTX_LOG" \
     || fail "the RTSP session was not torn down (see $MTX_LOG)"
 pass "the pull stops when nobody watches, closing the RTSP session"
 
-# --- 7. run.sh stop leaves no pull behind -----------------------------------
+# --- 7. run.sh stop takes the pull down and nothing else --------------------
 
+# What a blanket `pkill -x ffmpeg` used to take with it: someone else's encoder.
+# -x matches comm, so a copy of sleep under that name is the cheapest stand-in.
+cp "$(command -v sleep)" "$TMP/ffmpeg"
+"$TMP/ffmpeg" 60 &
+FOREIGN_PID=$!
 post_play "$PLAY_KEY" "$RESP" >/dev/null
 wait_for_pull 10 || fail "pull did not start for the stop test"
 "$BASE/run.sh" stop >/dev/null 2>&1 || true
@@ -403,7 +410,9 @@ done
 [ "$GONE" -eq 1 ] || fail "pull $(pull_pids) survived run.sh stop"
 log_has "rtsp_pull: worker exiting, stopping pid=" \
     || fail "no worker-exit line in $LOG (the exit hook did not run)"
-pass "run.sh stop takes the pull down with the worker"
+kill -0 "$FOREIGN_PID" 2>/dev/null \
+    || fail "run.sh stop killed an unrelated ffmpeg (pid $FOREIGN_PID)"
+pass "run.sh stop takes the pull down with the worker, and leaves others alone"
 
 # --- 8. a missing ffmpeg fails the pull, not the play ------------------------
 
