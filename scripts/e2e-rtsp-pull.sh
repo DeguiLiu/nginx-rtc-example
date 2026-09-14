@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 # e2e-rtsp-pull.sh - guard the on-demand RTSP pull (deploy/nginx/conf/rtsp_pull.lua).
 #
-# The RS500 is not on the bench, so the RTSP leg is stubbed: a fake `ffmpeg`
-# first on PATH ignores the RTSP input it is handed and publishes a real
-# testsrc2 stream to the RTMP URL the manager built. Everything this guard is
-# about is then real -- the Lua that decides when to spawn, the ingest token it
-# mints from the publish secret, the RTMP -> RTC bridge, and the werift viewer
-# whose subscriber count is what keeps the pull alive.
+# The RS500 device is the only substituted part of the chain: scripts/fetch-deps.sh
+# caches a pinned mediamtx, this script publishes a real testsrc2 H264 stream into
+# it over RTSP/TCP, and rtsp_pull.lua then pulls that URL for real -- RTSP session
+# and teardown, RTP-over-TCP interleave, `-c copy` remux into the local RTMP
+# ingest, the RTMP -> RTC bridge, and the werift viewer whose subscriber count is
+# what keeps the pull alive. mediamtx is configured for RTP-over-TCP only, the
+# transport the RS500 profile requires and the design doc settles on.
 #
-# The stub is also what makes "how many pulls are alive" observable: it execs the
-# real ffmpeg with a run-unique argv[0] marker, so `pgrep -f` counts pulls and
-# nothing else.
+# Counting pulls: the manager's own ffmpeg is the only process on the box whose
+# command line carries -allowed_media_types (mediamtx and the test publisher do
+# not), so that flag is the discriminator.
 #
 # The infrared stream is video-only, so the assertions are on the viewer's video
 # track. client/play.mjs's own verdict requires audio AND video, so its exit code
 # is deliberately not the assertion here.
 #
-# This script owns the nginx instance for its duration: it stops whatever is
-# running, starts the instance itself (the stub has to be on the worker's PATH),
-# and stops it again on exit. Idle reclaim alone takes IDLE_SECONDS, so a full
-# run is minutes, not seconds.
+# This script owns the shared ports for its duration: it stops whatever instance
+# is running, starts its own nginx (standard 1935/18082) plus the RS500 stand-in
+# on 8555, and stops both on exit. Idle reclaim alone takes IDLE_SECONDS, so a
+# full run is minutes, not seconds.
+#
+# Teardown kills only what this script started. It deliberately avoids `run.sh
+# stop` there: that command's `pkill -x ffmpeg` would take an operator's unrelated
+# ffmpeg processes with it. Step 7 exercises `run.sh stop` on purpose, once.
 #
 # Usage: scripts/e2e-rtsp-pull.sh   (OPENRESTY_PREFIX selects the nginx prefix)
 set -euo pipefail
@@ -30,31 +35,45 @@ STATS="http://127.0.0.1:18082/rtc/v1/stats"
 PLAY="http://127.0.0.1:18082/rtc/v1/play/"
 STREAM=ir
 IDLE_SECONDS=60
-RUNID="$$-$(date +%s)"
-MARK="rtsp-pull-stub-$RUNID"
-RTSP_URL="rtsp://127.0.0.1:6554/$RUNID"
-STUB_DIR="$(mktemp -d)"
-EMPTY_DIR="$(mktemp -d)"
-REQ="$(mktemp)"
-RESP="$(mktemp)"
+
+MTX_BIN="$BASE/scripts/_cache/mediamtx/mediamtx"
+RTSP_PORT=8555
+RTSP_PATH=irsrc
+RTSP_URL="rtsp://127.0.0.1:$RTSP_PORT/$RTSP_PATH"
+
+TMP="$(mktemp -d)"
+MTX_CONF="$TMP/mediamtx.yml"
+MTX_LOG="$TMP/mediamtx.log"
+PUB_LOG="$TMP/publisher.log"
+REQ="$TMP/req.json"
+RESP="$TMP/resp.json"
+EMPTY_DIR="$TMP/no-ffmpeg"
 LOG="$ORX/logs/error.log"
+
+MTX_PID=""
+PUB_PID=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "[PASS] $*"; }
 
 cleanup() {
-    rm -rf "$STUB_DIR" "$EMPTY_DIR" "$REQ" "$RESP"
-    "$BASE/run.sh" stop >/dev/null 2>&1 || true
+    [ -n "$PUB_PID" ] && kill "$PUB_PID" 2>/dev/null || true
+    [ -n "$MTX_PID" ] && kill "$MTX_PID" 2>/dev/null || true
+    if [ -f "$ORX/logs/nginx.pid" ]; then
+        ( cd "$ORX" && ./sbin/nginx -p . -c conf/nginx.rtc.conf -s stop ) >/dev/null 2>&1 || true
+    fi
+    rm -rf "$TMP"
 }
 trap cleanup EXIT
 
 [ -x "$ORX/sbin/nginx" ] || fail "no nginx at $ORX/sbin/nginx (set OPENRESTY_PREFIX)"
+[ -x "$MTX_BIN" ] || fail "no mediamtx at $MTX_BIN (run scripts/fetch-deps.sh)"
 command -v ffmpeg >/dev/null || fail "ffmpeg not found on PATH"
 REAL_FFMPEG="$(command -v ffmpeg)"
 
-# Counts pulls by the marker the stub bakes into its argv[0]: an ffmpeg started
-# by anything else (another e2e guard, a demo push) does not match.
-pull_pids() { pgrep -f -- "$MARK" 2>/dev/null || true; }
+# --- helpers -----------------------------------------------------------------
+
+pull_pids() { pgrep -f -- "-allowed_media_types" 2>/dev/null || true; }
 pull_count() { pull_pids | wc -l; }
 
 stats() { curl -fsS --max-time 3 "$STATS" || true; }
@@ -63,6 +82,15 @@ wait_for_stats() {
     local i
     for i in $(seq 1 20); do
         curl -fsS --max-time 2 "$STATS" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_tcp_port() {  # <port> <seconds>
+    local i
+    for i in $(seq 1 "$2"); do
+        ss -lnt 2>/dev/null | grep -q ":$1 " && return 0
         sleep 1
     done
     return 1
@@ -205,36 +233,71 @@ play_until_media() {  # <duration_ms> <outfile> <attempts>
     return 1
 }
 
-write_stub() {
-    cat > "$STUB_DIR/ffmpeg" <<STUB
-#!/bin/bash
-# Stub for scripts/e2e-rtsp-pull.sh: the last argument is the RTMP URL the pull
-# manager built, so that is where the test video goes. exec -a keeps a run-unique
-# marker in argv[0], which is what the guard counts -- comm stays "ffmpeg", so
-# run.sh stop still reaches it. bash, not sh: exec -a is not in POSIX sh, and
-# dash exits 127 on it, which reads as "ffmpeg is missing".
-last=""
-for arg in "\$@"; do last="\$arg"; done
-exec -a "$MARK" "$REAL_FFMPEG" -nostdin -v error -re -f lavfi \\
-    -i testsrc2=size=320x180:rate=15 -c:v libx264 -preset ultrafast \\
-    -tune zerolatency -g 15 -f flv "\$last"
-STUB
-    chmod +x "$STUB_DIR/ffmpeg"
+# --- the RS500 stand-in: an RTSP server plus a publisher ----------------------
+
+# RTSP only, RTP over TCP only (rtspTransports), everything else off: the guard
+# must not open ports it does not use, and the device profile is TCP interleaved.
+write_mtx_conf() {
+    cat > "$MTX_CONF" <<YML
+logLevel: info
+logDestinations: [stdout]
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:$RTSP_PORT
+rtspsAddress: ""
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+api: false
+metrics: false
+playback: false
+paths:
+  all_others:
+YML
 }
 
-# --- 0. own the instance, with the stub on the workers' PATH ------------------
+# setsid: the stand-in must not be reaped when this shell's process group is torn
+# down mid-run, and its own pid is what cleanup kills.
+start_rtsp_server() {
+    write_mtx_conf
+    setsid nohup "$MTX_BIN" "$MTX_CONF" >"$MTX_LOG" 2>&1 </dev/null &
+    MTX_PID=$!
+    wait_for_tcp_port "$RTSP_PORT" 10 \
+        || fail "mediamtx did not listen on $RTSP_PORT (see $MTX_LOG)"
+}
+
+# What the RS500 does for a living: one H264 track over RTSP, no audio, keyframe
+# every second. -re keeps it realtime; the stream runs for the whole guard.
+start_publisher() {
+    setsid nohup "$REAL_FFMPEG" -nostdin -loglevel error -re \
+        -f lavfi -i testsrc2=size=320x180:rate=15 \
+        -c:v libx264 -preset ultrafast -tune zerolatency -g 15 -bf 0 \
+        -f rtsp -rtsp_transport tcp "$RTSP_URL" >"$PUB_LOG" 2>&1 </dev/null &
+    PUB_PID=$!
+    sleep 2
+    kill -0 "$PUB_PID" 2>/dev/null \
+        || fail "the RTSP publisher exited: $(tail -3 "$PUB_LOG")"
+}
+
+# --- 0. own the ports, bring up the stand-in and the instance ----------------
 
 "$BASE/run.sh" stop >/dev/null 2>&1 || true
-write_stub
 PLAY_KEY="$(secret_for play)"
 PUB_KEY="$(secret_for publish)"
 [ -n "$PLAY_KEY" ] || fail "no live/$STREAM play secret in stream_keys.lua"
 [ -n "$PUB_KEY" ] || fail "no live/$STREAM publish secret in stream_keys.lua"
 
-echo "[setup] starting nginx with the stub ffmpeg on PATH"
+echo "[setup] RTSP stand-in: mediamtx on $RTSP_PORT + publisher -> $RTSP_URL"
+start_rtsp_server
+start_publisher
+pass "a real RTSP source is serving H264 over TCP"
+
+echo "[setup] starting nginx"
 LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-( cd "$BASE" && PATH="$STUB_DIR:$PATH" RS500_RTSP_URL="$RTSP_URL" \
-    OPENRESTY_PREFIX="$ORX" ./run.sh nginx ) >/dev/null || fail "cannot start nginx"
+( cd "$BASE" && RS500_RTSP_URL="$RTSP_URL" OPENRESTY_PREFIX="$ORX" \
+    ./run.sh nginx ) >/dev/null || fail "cannot start nginx"
 wait_for_stats || fail "nginx did not answer $STATS within 20s"
 
 # --- 1. a rejected play never wakes the pull ---------------------------------
@@ -259,7 +322,9 @@ CODE="$(post_play "$PLAY_KEY" "$RESP")"
 wait_for_pull 10 || fail "no pull started within 10s of an authorized play"
 [ "$(pull_count)" -eq 1 ] || fail "want exactly 1 pull, got $(pull_count)"
 wait_for_state 1 0 15 || fail "live/$STREAM never published (state=$(stream_state))"
-pass "the first authorized play starts exactly one pull"
+grep -q "is reading from path '$RTSP_PATH', with TCP, 1 track (H264)" "$MTX_LOG" \
+    || fail "the pull did not open an RTSP/TCP H264 session (see $MTX_LOG)"
+pass "the first authorized play starts exactly one pull, over real RTSP/TCP"
 
 play_until_media 3000 "$RESP.play" 8 || fail "a viewer never received video packets"
 wait_for_state 1 1 10 || fail "the pull has no subscriber (state=$(stream_state))"
@@ -319,7 +384,11 @@ if [ "$ST" != "none" ] && [ "${ST% *}" != "0" ]; then
 fi
 log_has "rtsp_pull: no viewer for ${IDLE_SECONDS}s, stopping pid=" \
     || fail "no idle-stop line in $LOG"
-pass "the pull stops when nobody watches, and says so in the log"
+# The reclaim must close the RTSP session, not just drop the process: mediamtx
+# logs the reader going away.
+grep -q "destroyed: torn down by" "$MTX_LOG" \
+    || fail "the RTSP session was not torn down (see $MTX_LOG)"
+pass "the pull stops when nobody watches, closing the RTSP session"
 
 # --- 7. run.sh stop leaves no pull behind -----------------------------------
 
@@ -338,8 +407,8 @@ pass "run.sh stop takes the pull down with the worker"
 
 # --- 8. a missing ffmpeg fails the pull, not the play ------------------------
 
-# run.sh itself needs the usual tools, so the stub directory is prepended to a
-# PATH that has them and no ffmpeg (the real one lives in ~/.local/bin, which is
+# run.sh itself needs the usual tools, so the empty stub directory is prepended to
+# a PATH that has them and no ffmpeg (the real one lives in ~/.local/bin, which is
 # deliberately absent here).
 echo "[setup] restarting nginx with no ffmpeg on PATH"
 LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
