@@ -51,4 +51,12 @@ return {
 
     ["live/luahotload|play"] = "lua-secret-abcdef0123456789abcdef012345",
     ["live/luahotload|publish"] = "lua-push-0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+
+    -- RS500 infrared stream, pulled on demand by conf/rtsp_pull.lua. Its own
+    -- pair rather than a copy of live/livestream's: the play secret travels to
+    -- every viewer of the page, and the publish secret is what the pull manager
+    -- mints the ingest token with. Sharing either value across streams would let
+    -- a viewer of one stream publish to the other.
+    ["live/ir|play"]    = "22a50a062a25f8a8223c59d20a9a1124",
+    ["live/ir|publish"] = "82911d692e7ab9e461ef77daa9be5506",
 }
