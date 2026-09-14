@@ -142,8 +142,16 @@ start_push() {
     # pure VBR: an ultrafast I-frame spikes far above the ~2.1 Mbps average and
     # overruns the path -- measured as ~52% loss on the original stream while
     # the CBR-capped transcode rungs on the same link stayed at 0%.
+    #
+    # -re goes on *both* inputs. It is a per-input option, and pacing only the
+    # video leaves the sine source free to generate samples at full speed: the
+    # unpaced audio races ahead of the muxer and drags the video with it.
+    # Measured on 1920x1080@30 loopback, end-to-end from the encoder's own
+    # output clock to the player: p50 173 ms unpaced vs 44 ms paced, against
+    # 18 ms for a video-only push. The RTC leg is not involved -- an RTCP
+    # sender report places it at ~0 ms either way.
     TZ=Asia/Shanghai ffmpeg -re -f lavfi -i testsrc2=size=640x360:rate=30 \
-        -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+        -re -f lavfi -i sine=frequency=1000:sample_rate=48000 \
         -vf "$vf_clk" \
         -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -bf 0 -pix_fmt yuv420p \
         -maxrate 2500k -bufsize 1000k \
