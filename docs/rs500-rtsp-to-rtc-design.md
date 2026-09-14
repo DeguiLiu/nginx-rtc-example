@@ -181,7 +181,7 @@ HTTP-FLV 的现有 `flvcnt:*` 计数会在长连接中自然过期，源码也�
 
 ## 5. 验收
 
-软件侧已由 `scripts/e2e-rtsp-pull.sh` 覆盖（见 `docs/测试文档.md`）：它把一个 stub `ffmpeg` 放到 worker 的 `PATH` 首位，后者忽略 RTSP 入参并真的向拉流器给的 RTMP URL 推 `testsrc2`，因此被验证的是真实链路（授权播放唤醒、token 签发、RTMP → RTC 桥、werift 订阅计入 `clients`、空闲回收、worker 退出清理、缺 `ffmpeg` 降级），只有 RS500 的 RTSP 一段是替代品。下表是需要真机在场的部分。
+软件侧已由 `scripts/e2e-rtsp-pull.sh` 覆盖（见 `docs/测试文档.md`）：唯一的替身是 RS500 设备本身——`scripts/fetch-deps.sh` 缓存固定版本的 mediamtx 作为 RTSP 服务端，脚本向它推一路真实 H264，再由 `rtsp_pull.lua` 真的按需拉取。因此被验证的是真实链路：RTSP 会话的建立与拆除、RTP-over-TCP 交织、`-c copy` 转封装进本机 RTMP、RTMP → RTC 桥、werift 订阅计入 `clients`、空闲回收、worker 退出清理与缺 `ffmpeg` 降级。mediamtx 只开 RTSP 且限定 `rtspTransports: [tcp]`，与设备侧的传输要求一致。下表是需要真机在场的部分。
 
 | 步骤 | 动作 | 通过判据 |
 |---|---|---|
