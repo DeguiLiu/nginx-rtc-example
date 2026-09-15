@@ -46,6 +46,17 @@ local function sample(premature)
     -- ngx.time(), not math.floor(ngx.now()): this is a whole-second stamp, and
     -- now_slot() above has already refreshed the cached time with ngx.now().
     local ts = ngx.time()
+    -- Worst round trip across every session, from the per-session reports the C
+    -- side mirrors. Max, not mean: one viewer on a bad path is the thing worth
+    -- seeing in a trend, and it is exactly what an average hides.
+    local rtt = 0
+    for _, s in ipairs(d.streams or {}) do
+        for _, x in ipairs(s.sessions or {}) do
+            local v = x.rtt_ms or 0
+            if v > rtt then rtt = v end
+        end
+    end
+
     local pt = {
         ts = ts,
         streams = d.total_streams or 0,
@@ -54,6 +65,7 @@ local function sample(premature)
         audio_octets = d.total_audio_octets or 0,
         video_bps = 0,
         audio_bps = 0,
+        rtt_ms = rtt,
     }
 
     -- Diff cumulative octets against the previous slot to get a bitrate.
