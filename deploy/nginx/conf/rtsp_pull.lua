@@ -38,7 +38,16 @@ local MAX_BACKOFF  = 30    -- cap on the respawn delay after an unexpected exit
 local TERM_GRACE   = 5     -- seconds between SIGTERM and SIGKILL
 local STDERR_KEEP  = 2000  -- bytes of ffmpeg output kept for the log
 local READ_CHUNK   = 4096  -- bytes per stdout_read_any() call (the argument is not optional)
-local RTMP_PREFIX  = "rtmp://127.0.0.1:1935/"
+
+-- Where the pulled stream is published, as a prefix (the stream name and the
+-- token are appended). Overridable because a second instance on this host does
+-- not own 1935: scripts/isolated-instance.sh runs one on 11935, and a pull that
+-- keeps aiming at 1935 would publish into whatever instance happens to own it
+-- -- the isolated one would then never see the source it started.
+local RTMP_PREFIX = os.getenv("RS500_RTMP_PREFIX") or "rtmp://127.0.0.1:1935/"
+if "/" ~= RTMP_PREFIX:sub(-1) then
+    RTMP_PREFIX = RTMP_PREFIX .. "/"
+end
 
 -- POSIX signal numbers, the only platforms ngx.pipe supports.
 local SIGTERM, SIGKILL = 15, 9

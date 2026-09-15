@@ -17,29 +17,66 @@
 # track. client/play.mjs's own verdict requires audio AND video, so its exit code
 # is deliberately not the assertion here.
 #
-# This script owns the shared ports for its duration: it stops whatever instance
-# is running, starts its own nginx (standard 1935/18082) plus the RS500 stand-in
-# on 8555, and stops both on exit. Idle reclaim alone takes IDLE_SECONDS, so a
+# Two modes:
+#
+#   default  Owns the instance on the standard ports: stops whatever is running
+#            (`run.sh stop`), starts its own nginx, stops it on exit.
+#   attach   GUARD_ATTACH=1: never starts or stops nginx. An instance must
+#            already be answering GUARD_HTTP_PORT -- start one that cannot
+#            disturb anyone else with scripts/isolated-instance.sh (11935/28082):
+#
+#              RS500_RTSP_URL=rtsp://127.0.0.1:8556/irsrc \
+#              RS500_RTMP_PREFIX=rtmp://127.0.0.1:11935/ \
+#                scripts/isolated-instance.sh up
+#              GUARD_ATTACH=1 GUARD_HTTP_PORT=28082 GUARD_RTSP_PORT=8556 \
+#              GUARD_LOG=build/nginx-iso/nginx/logs/error.log \
+#              GUARD_STOP_CMD="scripts/isolated-instance.sh down" \
+#                scripts/e2e-rtsp-pull.sh
+#
+#            RS500_RTMP_PREFIX is what keeps an isolated instance's pull out of
+#            the shared prefix's ingest (see conf/rtsp_pull.lua).
+#
+# Either way the RS500 stand-in (mediamtx + its publisher) is this script's own,
+# and is started on GUARD_RTSP_PORT. Idle reclaim alone takes IDLE_SECONDS, so a
 # full run is minutes, not seconds.
 #
 # Teardown kills only what this script started, and stops nginx through the
 # prefix's own pid file: the guard starts no push/transcode supervisor, so there
 # is nothing else of this repo's to bring down.
 #
-# Usage: scripts/e2e-rtsp-pull.sh   (OPENRESTY_PREFIX selects the nginx prefix)
+# Usage: scripts/e2e-rtsp-pull.sh
+#
+# Env:
+#   OPENRESTY_PREFIX          nginx prefix, default mode (default build/nginx/nginx)
+#   GUARD_ATTACH              1 = attach to a running instance (above)
+#   GUARD_HTTP_PORT           signaling/stats port (default 18082)
+#   GUARD_RTSP_PORT           port for the RS500 stand-in (default 8555)
+#   GUARD_LOG                 instance error log (default <prefix>/logs/error.log)
+#   GUARD_STOP_CMD            how to stop the instance in attach mode; unset there
+#                             skips step 7. Default mode uses `run.sh stop`.
+#   GUARD_START_CMD           how to start the instance in attach mode; step 8
+#                             needs it to bring the instance up again without
+#                             ffmpeg on PATH. Unset there skips step 8.
+#   GUARD_INSTANCE_RTMP_PORT  the instance's own RTMP port, for the attach-mode
+#                             hint (default 1935)
 set -euo pipefail
 
 BASE="$(cd "$(dirname "$0")/.." && pwd)"
 ORX="${OPENRESTY_PREFIX:-$BASE/build/nginx/nginx}"
-STATS="http://127.0.0.1:18082/rtc/v1/stats"
-PLAY="http://127.0.0.1:18082/rtc/v1/play/"
+ATTACH="${GUARD_ATTACH:-0}"
+HTTP_PORT="${GUARD_HTTP_PORT:-18082}"
+STATS="http://127.0.0.1:$HTTP_PORT/rtc/v1/stats"
+PLAY="http://127.0.0.1:$HTTP_PORT/rtc/v1/play/"
 STREAM=ir
 IDLE_SECONDS=60
 
 MTX_BIN="$BASE/scripts/_cache/mediamtx/mediamtx"
-RTSP_PORT=8555
+RTSP_PORT="${GUARD_RTSP_PORT:-8555}"
 RTSP_PATH=irsrc
 RTSP_URL="rtsp://127.0.0.1:$RTSP_PORT/$RTSP_PATH"
+STOP_CMD="${GUARD_STOP_CMD:-}"
+START_CMD="${GUARD_START_CMD:-}"
+INSTANCE_RTMP_PORT="${GUARD_INSTANCE_RTMP_PORT:-1935}"
 
 TMP="$(mktemp -d)"
 MTX_CONF="$TMP/mediamtx.yml"
@@ -48,7 +85,7 @@ PUB_LOG="$TMP/publisher.log"
 REQ="$TMP/req.json"
 RESP="$TMP/resp.json"
 EMPTY_DIR="$TMP/no-ffmpeg"
-LOG="$ORX/logs/error.log"
+LOG="${GUARD_LOG:-$ORX/logs/error.log}"
 
 MTX_PID=""
 PUB_PID=""
@@ -61,14 +98,16 @@ cleanup() {
     [ -n "$FOREIGN_PID" ] && kill "$FOREIGN_PID" 2>/dev/null || true
     [ -n "$PUB_PID" ] && kill "$PUB_PID" 2>/dev/null || true
     [ -n "$MTX_PID" ] && kill "$MTX_PID" 2>/dev/null || true
-    if [ -f "$ORX/logs/nginx.pid" ]; then
+    # Attached mode did not start this instance, so it must not stop it either.
+    if [ "$ATTACH" != 1 ] && [ -f "$ORX/logs/nginx.pid" ]; then
         ( cd "$ORX" && ./sbin/nginx -p . -c conf/nginx.rtc.conf -s stop ) >/dev/null 2>&1 || true
     fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT
 
-[ -x "$ORX/sbin/nginx" ] || fail "no nginx at $ORX/sbin/nginx (set OPENRESTY_PREFIX)"
+[ "$ATTACH" = 1 ] || [ -x "$ORX/sbin/nginx" ] \
+    || fail "no nginx at $ORX/sbin/nginx (set OPENRESTY_PREFIX)"
 [ -x "$MTX_BIN" ] || fail "no mediamtx at $MTX_BIN (run scripts/fetch-deps.sh)"
 command -v ffmpeg >/dev/null || fail "ffmpeg not found on PATH"
 REAL_FFMPEG="$(command -v ffmpeg)"
@@ -171,7 +210,7 @@ print("t=%s&sign=%s" % (t, sig))
 post_play() {  # <key> <response outfile> -> prints the HTTP status code
     python3 -c '
 import json, sys
-stream, qs = sys.argv[1], sys.argv[2]
+stream, qs, port = sys.argv[1], sys.argv[2], sys.argv[3]
 t = dict(p.split("=", 1) for p in qs.split("&"))
 sdp = (
     "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
@@ -183,17 +222,18 @@ sdp = (
     "a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtpmap:96 H264/90000\r\n"
 )
 print(json.dumps({
-    "streamurl": "webrtc://127.0.0.1:18082/live/" + stream,
+    "streamurl": "webrtc://127.0.0.1:" + port + "/live/" + stream,
     "t": int(t["t"]), "sign": t["sign"], "sdp": sdp,
 }))
-' "$STREAM" "$(sign_with "$1")" > "$REQ"
+' "$STREAM" "$(sign_with "$1")" "$HTTP_PORT" > "$REQ"
     curl -s -o "$2" -w '%{http_code}' --max-time 5 -X POST "$PLAY" \
         -H 'Content-Type: application/json' --data-binary @"$REQ" || true
 }
 
 play_once() {  # <duration_ms> <outfile>
-    node "$BASE/client/play.mjs" --stream "webrtc://127.0.0.1:18082/live/$STREAM" \
-        --key "$PLAY_KEY" --duration "$1" --json >"$2" 2>"$2.err" || true
+    node "$BASE/client/play.mjs" --stream "webrtc://127.0.0.1:$HTTP_PORT/live/$STREAM" \
+        --api "http://127.0.0.1:$HTTP_PORT" --key "$PLAY_KEY" \
+        --duration "$1" --json >"$2" 2>"$2.err" || true
 }
 
 video_pkts() {  # <play.mjs --json output> -> packets received on the video track
@@ -283,24 +323,33 @@ start_publisher() {
         || fail "the RTSP publisher exited: $(tail -3 "$PUB_LOG")"
 }
 
-# --- 0. own the ports, bring up the stand-in and the instance ----------------
+# --- 0. bring up the stand-in, and the instance unless attached --------------
 
-"$BASE/run.sh" stop >/dev/null 2>&1 || true
+if [ "$ATTACH" = 1 ]; then
+    wait_for_stats || fail "no instance answering $STATS (start one first; see the header)"
+    echo "[setup] attach mode: using the instance already on port $HTTP_PORT"
+    echo "[setup] it must have been started with RS500_RTSP_URL=$RTSP_URL"
+    echo "[setup] and RS500_RTMP_PREFIX=rtmp://127.0.0.1:$INSTANCE_RTMP_PORT/"
+else
+    "$BASE/run.sh" stop >/dev/null 2>&1 || true
+fi
 PLAY_KEY="$(secret_for play)"
 PUB_KEY="$(secret_for publish)"
 [ -n "$PLAY_KEY" ] || fail "no live/$STREAM play secret in stream_keys.lua"
 [ -n "$PUB_KEY" ] || fail "no live/$STREAM publish secret in stream_keys.lua"
+LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 
 echo "[setup] RTSP stand-in: mediamtx on $RTSP_PORT + publisher -> $RTSP_URL"
 start_rtsp_server
 start_publisher
 pass "a real RTSP source is serving H264 over TCP"
 
-echo "[setup] starting nginx"
-LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-( cd "$BASE" && RS500_RTSP_URL="$RTSP_URL" OPENRESTY_PREFIX="$ORX" \
-    ./run.sh nginx ) >/dev/null || fail "cannot start nginx"
-wait_for_stats || fail "nginx did not answer $STATS within 20s"
+if [ "$ATTACH" != 1 ]; then
+    echo "[setup] starting nginx"
+    ( cd "$BASE" && RS500_RTSP_URL="$RTSP_URL" OPENRESTY_PREFIX="$ORX" \
+        ./run.sh nginx ) >/dev/null || fail "cannot start nginx"
+    wait_for_stats || fail "nginx did not answer $STATS within 20s"
+fi
 
 # --- 1. a rejected play never wakes the pull ---------------------------------
 
@@ -392,7 +441,7 @@ grep -q "destroyed: torn down by" "$MTX_LOG" \
     || fail "the RTSP session was not torn down (see $MTX_LOG)"
 pass "the pull stops when nobody watches, closing the RTSP session"
 
-# --- 7. run.sh stop takes the pull down and nothing else --------------------
+# --- 7. stopping the instance takes the pull down, and nothing else ----------
 
 # What a blanket `pkill -x ffmpeg` used to take with it: someone else's encoder.
 # -x matches comm, so a copy of sleep under that name is the cheapest stand-in.
@@ -401,37 +450,66 @@ cp "$(command -v sleep)" "$TMP/ffmpeg"
 FOREIGN_PID=$!
 post_play "$PLAY_KEY" "$RESP" >/dev/null
 wait_for_pull 10 || fail "pull did not start for the stop test"
-"$BASE/run.sh" stop >/dev/null 2>&1 || true
+if [ "$ATTACH" = 1 ]; then
+    [ -n "$STOP_CMD" ] || fail "attach mode needs GUARD_STOP_CMD to stop the instance"
+    echo "[setup] stopping the instance: $STOP_CMD"
+    ( cd "$BASE" && bash -c "$STOP_CMD" ) >/dev/null 2>&1 || true
+else
+    "$BASE/run.sh" stop >/dev/null 2>&1 || true
+fi
 GONE=0
 for _ in $(seq 1 10); do
     if [ "$(pull_count)" -eq 0 ]; then GONE=1; break; fi
     sleep 1
 done
-[ "$GONE" -eq 1 ] || fail "pull $(pull_pids) survived run.sh stop"
+[ "$GONE" -eq 1 ] || fail "pull $(pull_pids) outlived the instance"
 log_has "rtsp_pull: worker exiting, stopping pid=" \
     || fail "no worker-exit line in $LOG (the exit hook did not run)"
 kill -0 "$FOREIGN_PID" 2>/dev/null \
-    || fail "run.sh stop killed an unrelated ffmpeg (pid $FOREIGN_PID)"
-pass "run.sh stop takes the pull down with the worker, and leaves others alone"
+    || fail "stopping the instance killed an unrelated ffmpeg (pid $FOREIGN_PID)"
+pass "stopping the instance takes the pull down with the worker, and leaves others alone"
 
 # --- 8. a missing ffmpeg fails the pull, not the play ------------------------
 
-# run.sh itself needs the usual tools, so the empty stub directory is prepended to
-# a PATH that has them and no ffmpeg (the real one lives in ~/.local/bin, which is
-# deliberately absent here).
-echo "[setup] restarting nginx with no ffmpeg on PATH"
-LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-( cd "$BASE" && PATH="$EMPTY_DIR:/usr/bin:/bin" RS500_RTSP_URL="$RTSP_URL" \
-    OPENRESTY_PREFIX="$ORX" ./run.sh nginx ) >/dev/null || fail "cannot restart nginx"
-wait_for_stats || fail "nginx did not answer $STATS after the restart"
-CODE="$(post_play "$PLAY_KEY" "$RESP")"
-[ "$CODE" = "200" ] || fail "play with no ffmpeg returned HTTP $CODE, want 200"
-sleep 3
-wait_for_stats || fail "nginx stopped answering after the failed spawn"
-[ "$(pull_count)" -eq 0 ] || fail "a pull appeared without ffmpeg: $(pull_pids)"
-log_has "rtsp_pull: spawn failed" || log_has "rtsp_pull: ffmpeg exited" \
-    || fail "no spawn-failure line in $LOG"
-pass "a missing ffmpeg fails the pull, not the play request"
+# The instance has to come back up with a PATH that has no ffmpeg. The empty stub
+# directory is prepended to a PATH that still has the usual tools: the real ffmpeg
+# lives in ~/.local/bin, which is deliberately absent. Default mode restarts
+# through run.sh; attach mode needs GUARD_START_CMD for the same restart and says
+# so when it has none, rather than quietly dropping the assertion.
+if [ "$ATTACH" = 1 ] && [ -z "$START_CMD" ]; then
+    echo "[skip] step 8: attach mode without GUARD_START_CMD cannot restart the instance"
+else
+    echo "[setup] restarting the instance with no ffmpeg on PATH"
+    LOG_START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    if [ "$ATTACH" = 1 ]; then
+        # Kept, not discarded: a start that fails here fails for the operator's
+        # own reason (nginx resolves relative paths -- hls_path and friends --
+        # against the working directory, so a command without a `cd` into the
+        # prefix dies on mkdir), and the message is the only way to see it.
+        if ! ( cd "$BASE" && PATH="$EMPTY_DIR:/usr/bin:/bin" bash -c "$START_CMD" ) \
+                >"$TMP/start.log" 2>&1; then
+            tail -5 "$TMP/start.log" >&2
+            fail "GUARD_START_CMD failed"
+        fi
+    else
+        ( cd "$BASE" && PATH="$EMPTY_DIR:/usr/bin:/bin" RS500_RTSP_URL="$RTSP_URL" \
+            OPENRESTY_PREFIX="$ORX" ./run.sh nginx ) >/dev/null || fail "cannot restart nginx"
+    fi
+    wait_for_stats || fail "the instance did not answer $STATS after the restart"
+    CODE="$(post_play "$PLAY_KEY" "$RESP")"
+    [ "$CODE" = "200" ] || fail "play with no ffmpeg returned HTTP $CODE, want 200"
+    sleep 3
+    wait_for_stats || fail "the instance stopped answering after the failed spawn"
+    [ "$(pull_count)" -eq 0 ] || fail "a pull appeared without ffmpeg: $(pull_pids)"
+    log_has "rtsp_pull: spawn failed" || log_has "rtsp_pull: ffmpeg exited" \
+        || fail "no spawn-failure line in $LOG"
+    pass "a missing ffmpeg fails the pull, not the play request"
+
+    # Attached mode started this instance for the step; leave nothing running.
+    if [ "$ATTACH" = 1 ]; then
+        ( cd "$BASE" && bash -c "$STOP_CMD" ) >/dev/null 2>&1 || true
+    fi
+fi
 
 echo
 echo "all steps passed"
