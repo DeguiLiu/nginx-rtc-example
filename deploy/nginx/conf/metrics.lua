@@ -3,6 +3,7 @@
 
 local ngx = ngx
 local cjson = require "cjson"
+local client_latency = require "client_latency"
 
 local raw = ngx.shared.rtc_stats:get("stats")
 ngx.header["Content-Type"] = "text/plain; version=0.0.4"
@@ -67,6 +68,36 @@ help("rtc_send_failed", "RTP datagrams dropped per stream (send NGX_ERROR / shor
 typ("rtc_send_failed", "counter")
 help("rtc_send_eagain", "RTP datagrams dropped per stream (send NGX_AGAIN, UDP buffer full).")
 typ("rtc_send_eagain", "counter")
+-- Per-reason drop accounting, summed over the stream's sessions. One series per
+-- reason rather than three metric names because the question they answer is
+-- always the same one -- "is the server dropping this stream's packets, and
+-- why" -- and a reason label keeps that a single query. silent is the one that
+-- has no other symptom: the server stopped sending to a session because the
+-- peer went quiet, which from the viewer's side is indistinguishable from loss.
+help("rtc_session_drops", "Media held back per stream, by the stage that refused it.")
+typ("rtc_session_drops", "counter")
+local DROP_REASONS = { "pacer", "gop", "silent" }
+-- Round trip on the media path, measured by this server from the clients'
+-- receiver reports (RFC 3550) -- the one latency that needs no cooperation
+-- beyond the RTCP the client already sends. Worst session, not mean: a single
+-- viewer on a bad path is what an operator needs to see, and averaging it
+-- against the healthy majority is how it stops being visible. 0 means no
+-- report has come back yet, which is different from 0 ms.
+help("rtc_stream_rtt_ms", "Worst session round trip per stream, milliseconds (0 = no report yet).")
+typ("rtc_stream_rtt_ms", "gauge")
+-- The other half of the latency story, and the only half the server cannot
+-- measure for itself: what the viewer's browser saw between ingest and the
+-- frame being on screen. Reported by the player page and joined here by ICE
+-- ufrag, so these series only exist for sessions that are still live -- a
+-- number from a tab that has gone away is not a measurement, it is a memory.
+-- Read it against rtc_stream_rtt_ms: if e2e is large while rtt is small, the
+-- time is in the viewer's jitter buffer or decoder, not on the wire.
+help("rtc_client_e2e_ms", "Viewer-measured ingest-to-display, milliseconds (page-reported mean).")
+typ("rtc_client_e2e_ms", "gauge")
+help("rtc_client_jitter_buffer_ms", "Viewer-side jitter buffer delay per frame, milliseconds.")
+typ("rtc_client_jitter_buffer_ms", "gauge")
+help("rtc_client_decode_ms", "Viewer-side decode time per frame, milliseconds.")
+typ("rtc_client_decode_ms", "gauge")
 
 sample("rtc_streams", nil, d.total_streams or 0)
 sample("rtc_clients", nil, d.total_clients or 0)
@@ -81,6 +112,37 @@ for _, s in ipairs(d.streams or {}) do
     sample("rtc_audio_octets", labels, (s.audio and s.audio.octets or 0))
     sample("rtc_send_failed", labels, s.send_failed or 0)
     sample("rtc_send_eagain", labels, s.send_eagain or 0)
+
+    local drops = { pacer = 0, gop = 0, silent = 0 }
+    local rtt_max = 0
+    for _, x in ipairs(s.sessions or {}) do
+        drops.pacer = drops.pacer + (x.drop_pacer or 0)
+        drops.gop = drops.gop + (x.drop_gop or 0)
+        drops.silent = drops.silent + (x.drop_silent or 0)
+        local v = x.rtt_ms or 0
+        if v > rtt_max then rtt_max = v end
+
+        -- Round trip is the server's own measurement; e2e is the viewer's. Only
+        -- sessions that are still in the registry get the second one, which is
+        -- what keeps a departed tab's last number from being exported forever.
+        local rep = client_latency.get(x.ufrag)
+        if rep then
+            local labels2 = { stream = s.name or "unknown", ufrag = x.ufrag or "" }
+            sample("rtc_client_e2e_ms", labels2, rep.e2e_ms or 0)
+            if rep.jb_ms then
+                sample("rtc_client_jitter_buffer_ms", labels2, rep.jb_ms)
+            end
+            if rep.decode_ms then
+                sample("rtc_client_decode_ms", labels2, rep.decode_ms)
+            end
+        end
+    end
+    for _, reason in ipairs(DROP_REASONS) do
+        sample("rtc_session_drops",
+               { stream = s.name or "unknown", reason = reason },
+               drops[reason])
+    end
+    sample("rtc_stream_rtt_ms", labels, rtt_max)
 end
 
 -- Session lifecycle states, from a count the C side takes over the whole shm
