@@ -91,7 +91,7 @@ Prefix resolution: `OPENRESTY_PREFIX`, then `build/nginx`, else error. `run.sh n
 
 | Port | Purpose |
 |---|---|
-| 18082 HTTP | `/flvplayer`, `/rtcplayer.html`, `/rtc/v1/stats`, `/rtc/v1/flvcnt`, `/metrics` |
+| 18082 HTTP | `/flvplayer`, `/rtcplayer.html`, `/rtc/v1/stats`, `/rtc/v1/flvcnt`, `/rtc/v1/report`, `/metrics` |
 | 1935 RTMP | push ingest + HTTP-FLV source |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 

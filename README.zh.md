@@ -91,7 +91,7 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 
 | 端口 | 用途 |
 |---|---|
-| 18082 HTTP | `/flvplayer`、`/rtcplayer.html`、`/rtc/v1/stats`、`/rtc/v1/flvcnt`、`/metrics` |
+| 18082 HTTP | `/flvplayer`、`/rtcplayer.html`、`/rtc/v1/stats`、`/rtc/v1/flvcnt`、`/rtc/v1/report`、`/metrics` |
 | 1935 RTMP | 推流 + HTTP-FLV 源 |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
