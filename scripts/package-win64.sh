@@ -33,6 +33,15 @@ done
 # Override with the auth-free HTTP-FLV config and the repo play pages/bat files.
 cp "$BASE/deploy/win32/nginx-flv.conf" "$PKG/conf/nginx.conf"
 cp -r "$BASE/deploy/nginx/html/." "$PKG/html/"
+# The Lua has to come from the repo, not from the prefix copied above. The
+# prefix is a snapshot of whatever the tree looked like when it was
+# cross-built, so packaging from it ships Lua that can be months older than the
+# config and pages next to it -- and the two are not independent: conf/*.lua
+# requires modules by name, so a prefix from before a module was added gives a
+# conf that requires a file the zip does not contain, and the endpoint 500s.
+# Copied after the prefix so it wins, and as a glob so a new module travels
+# with the endpoint that needs it.
+cp -f "$BASE/deploy/nginx/conf/"*.lua "$PKG/conf/"
 cp "$BASE/deploy/win32/start.bat" \
    "$BASE/deploy/win32/stop.bat" \
    "$BASE/deploy/win32/push_test.bat" \
