@@ -438,7 +438,13 @@ RTMP→WebRTC、RTMP→HTTP-FLV 均为直转。
 **flv.js**：纯 JS 的 HTTP-FLV 播放器：拉取 FLV 字节 → 解封装 → 喂 MSE，是浏览器端低延迟播放的事实方案。
 
 **enableStashBuffer**：flv.js 是否先内部缓冲再喂 MSE。开启 = 平滑但增加延迟；关闭 = 贴直播边缘但任何微
-抖动都直接 rebuffer 转圈。本仓库 flvplayer 在两者间反复权衡，最终取「开启 + 主动跳直播边缘」。
+抖动都直接 rebuffer 转圈。本仓库 flvplayer 在两者间反复权衡，最终取「开启 + 主动跳直播边缘」；但**纯视频
+流还必须 `hasAudio: false`，且首次 stash 阈值不能取默认的 384 KB**——默认阈值下纯视频流永远等不到第一次
+dispatch，取 32 KB。Windows/Edge 上同一页面、同一路 2 Mbps 纯视频流的实测：`hasAudio: true` + 默认 stash
+→ 22 s 内零 `appendBuffer`、不出画；只改 `hasAudio: false` → 仍不出画；只关 stash（`enableStashBuffer:
+false`，`hasAudio: true`）→ 仍不出画；`hasAudio: false` + `stashInitialSize: 32768` → 出画 536 ms
+（已采用）；`hasAudio: false` + `enableStashBuffer: false` → 出画 553 ms。理由与落地注释见
+`deploy/nginx/conf/flvplayer.lua`。
 
 **直播边缘（live edge）**：播放器当前能播到的最「新」位置。若缓冲积压而播放器不主动追赶，画面会越来
 越「旧」，甚至比墙钟晚几分钟；需周期性监测缓冲年龄并跳到直播边缘。
