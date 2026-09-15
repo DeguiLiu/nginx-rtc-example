@@ -5,36 +5,42 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WebRTC 低延迟直播播放器</title>
 <style>
-  body { font-family: "Microsoft YaHei", sans-serif; background: #f5f6fa; margin: 0; padding: 20px; color: #333; }
+  /* 全页正文一个字号，只有两处例外，且都是结构性的：页面标题和卡片标题。
+     其余任何自带字号的元素（标签、表格、日志、按钮、徽章）都会紧挨着基准
+     字号的内容出现，一旦不一致看上去就是排版事故；而完全没有 class 的容器
+     —— 延迟卡片原先就是 —— 会悄悄退回浏览器默认的 16px，把旁边的卡片压下去。 */
+  body { font-family: "Microsoft YaHei", sans-serif; background: #f5f6fa; margin: 0; padding: 20px; color: #333; font-size: 13px; }
   h1 { font-size: 20px; color: #1a73e8; margin: 0 0 4px; }
-  .sub { color: #888; font-size: 12px; margin-bottom: 16px; }
+  .sub { color: #888; margin-bottom: 16px; }
   .card { background: #fff; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px;
           box-shadow: 0 1px 3px rgba(0,0,0,.1); }
   .card h2 { font-size: 14px; color: #1a73e8; margin: 0 0 10px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
-  label { font-size: 13px; color: #555; min-width: 40px; }
-  input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+  /* 表单控件不继承父级字体：不写 font: inherit 就会退回 UA 默认的 13.3333px
+     Arial，和页面字体、字号都对不上。 */
+  label { color: #555; min-width: 40px; }
+  input { font: inherit; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
   input[type=text] { width: 160px; }
-  button { padding: 8px 18px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+  button { font: inherit; padding: 8px 18px; border: none; border-radius: 4px; cursor: pointer; }
   .btn-play { background: #1a73e8; color: #fff; }
   .btn-stop { background: #e33; color: #fff; }
   button:disabled { opacity: .5; cursor: not-allowed; }
   video { width: 100%; max-width: 720px; background: #000; border-radius: 4px; }
-  .stat { font-size: 13px; line-height: 1.8; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; margin-left:6px; }
+  .stat, #latency { line-height: 1.8; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; margin-left:6px; }
   .ok { background:#e6f4ea; color:#137333; } .err { background:#fce8e6; color:#c5221f; }
   .warn { background:#fef7e0; color:#b06000; }
-  .conn { display:flex; flex-wrap:wrap; gap:8px 16px; font-size:13px; }
+  .conn { display:flex; flex-wrap:wrap; gap:8px 16px; }
   .conn .item { color:#555; }
   .metric { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed #eee; }
   .metric .k { color:#777; }
   .metric .v { font-variant-numeric: tabular-nums; color:#222; }
-  table { width:100%; border-collapse:collapse; font-size:12px; }
+  table { width:100%; border-collapse:collapse; }
   th, td { border:1px solid #eee; padding:5px 8px; text-align:right; }
   th:first-child, td:first-child { text-align:left; }
-  #log { font-family: monospace; font-size: 12px; background: #1e1e1e; color: #7fdbca;
+  #log { font-family: monospace; background: #1e1e1e; color: #7fdbca;
          border-radius: 4px; padding: 10px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; }
-  .btn-res { background:#eef3fc; color:#1a73e8; padding:4px 12px; font-size:13px; }
+  .btn-res { background:#eef3fc; color:#1a73e8; padding:4px 12px; }
   .btn-res.on { background:#1a73e8; color:#fff; }
 </style>
 </head>
@@ -42,14 +48,14 @@
   <h1>🎬 WebRTC 低延迟直播播放器</h1>
   <div class="sub">RTMP → nginx 自研 RTC 模块 → WebRTC 浏览器播放 · 信令 /rtc/v1/play/ · ICE-lite · DTLS/SRTP</div>
   <div style="margin:2px 0 12px">
-    <a href="/" style="color:#888;font-size:13px;margin-right:14px;text-decoration:none">◀ 门户</a>
-    <a href="/flvplayer" style="color:#e8710a;font-size:13px;text-decoration:none">切换 HTTP-FLV 播放器 (亚秒/秒开) ▶</a>
+    <a href="/" style="color:#888;margin-right:14px;text-decoration:none">◀ 门户</a>
+    <a href="/flvplayer" style="color:#e8710a;text-decoration:none">切换 HTTP-FLV 播放器 (亚秒/秒开) ▶</a>
   </div>
 
   <div class="card">
     <div class="row"><label>服务器</label>
       <input type="text" id="host" placeholder="自动" title="本机 IP，如 172.16.48.122">
-      <span style="color:#888;font-size:12px">(留空自动取当前页面地址；跨机测试填 nginx 所在机器 IP)</span>
+      <span style="color:#888">(留空自动取当前页面地址；跨机测试填 nginx 所在机器 IP)</span>
     </div>
     <div class="row"><label>应用</label><input type="text" id="app" value="live">
       <label>流名</label><input type="text" id="stream" value="livestream">
@@ -60,7 +66,7 @@
       <button class="btn-res" data-r="720p" onclick="pickRes(this)">720p</button>
       <button class="btn-res" data-r="540p" onclick="pickRes(this)">540p</button>
       <button class="btn-res" data-r="360p" onclick="pickRes(this)">360p</button>
-      <span style="color:#888;font-size:12px">(原画=推流原始码流；其余为服务端转码档，需先启动 run.sh transcode)</span>
+      <span style="color:#888">(原画=推流原始码流；其余为服务端转码档，需先启动 run.sh transcode)</span>
     </div>
     <div class="row"><label>密钥</label><input type="text" id="key" value="demo-secret-0123456789abcdef0123456789abcdef">
       <button class="btn-play" id="btnPlay" onclick="play()">▶ 播放</button>
@@ -84,6 +90,11 @@
   </div>
 
   <div class="card">
+    <h2>延迟</h2>
+    <div id="latency">等待播放…</div>
+  </div>
+
+  <div class="card">
     <h2>客户端媒体统计（getStats）</h2>
     <div class="stat" id="stats">等待播放…</div>
   </div>
@@ -100,6 +111,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const el = { video: $("video"), state: $("state"), stats: $("stats"),
+             latency: $("latency"),
              serverStats: $("serverStats"), log: $("log"),
              btnPlay: $("btnPlay"), btnStop: $("btnStop") };
 let pc = null;
@@ -173,6 +185,136 @@ function setBadge(id, state) {
   b.className = "badge " + badgeCls(state);
 }
 
+// ---------------------------------------------------------------------------
+// 延迟
+//
+// 建连阶段由页面自己打点，口径与 CLI 的 client/connect_probe.mjs 一致：都是
+// performance.now() 的差值，所以两边可以直接对照。用 performance.now() 而不是
+// Date.now()，是因为后者在系统时钟被 NTP 校正时会跳，一次建连的几百毫秒里足以
+// 把某个阶段打成负数。
+//
+// ICE 和 DTLS 的完成事件不保证在 answer 之后到达（werift 就会先到），所以这里
+// 只记录时刻、按逻辑顺序渲染：某个阶段比前一个早，就显示为负值 —— 那是真实的
+// 乱序，不是计算错误。
+// ---------------------------------------------------------------------------
+const PHASE_ORDER = [
+  "pc 创建", "createOffer", "setLocalDescription", "ICE 收集完成",
+  "信令请求发出", "收到 answer", "answer 已应用",
+  "ICE 连通", "DTLS 连通", "首包 RTP", "首帧解码",
+];
+let phases = new Map();
+let tPhase = 0;
+
+// 服务端下发的锚点 = "某个 RTP 时间戳 + 那一刻的墙钟"。RTP 时间戳就是推流媒体
+// 时间(90kHz)，所以 anchorMs + (rtp_ts - anchorRtpTs)/90 就是该帧进入服务端的时刻。
+let latencyInfo = null;
+// 锚点每 2 秒随 RTCP SR 刷新一次（在 stats 轮询里取最新那份）：信令应答里那份是
+// 发起播放那一刻的，用久了会漂。now_* 只在算时钟偏移时用一次，不参与刷新。
+let anchorRtpTs = null;
+let anchorMs = null;
+// 本机时钟 − 服务端时钟，用信令请求的中点估算，误差是半个单程。没有它，服务端
+// 的 epoch 时间就没法和 performance.now()/Date.now() 相减。
+let clockOffsetMs = 0;
+// 单独一个标志：偏移量完全可能正好是 0（本机播放时两钟同源），不能拿它当"没测到"。
+let haveClockOffset = false;
+let tSigSent = 0;
+const E2E_CAP = 90;
+const e2eSamples = [];
+let lastLatencyRender = 0;
+
+// 页面测出的"接入→显示"里，抖动缓冲、解码、呈现这三段都发生在浏览器内，服务端
+// 看不到；唯一同时看到两端的时钟就是渲染这一帧的那个时钟。所以每 5 秒把这个均值
+// 回报给服务端一次，让它按 ufrag 和自己那份每会话统计对齐。
+//
+// ufrag 是服务端生成的，写在 answer SDP 里，页面从 answer 里读回来即可 —— 不需要
+// 服务端为这个功能多下发任何字段，也不需要 C 侧改动。
+let myUfrag = null;
+let reportTimer = null;
+let reportStatus = "";
+
+function markPhase(name) {
+  if (!tPhase || phases.has(name)) return;
+  phases.set(name, performance.now() - tPhase);
+  renderLatency();
+}
+
+function avg(a) { return a.reduce((x, y) => x + y, 0) / a.length; }
+
+/* 每显示一帧调一次。rtpTimestamp 是 RVFC 对 WebRTC 流才给的字段（正是接收端唯一
+ * 能拿到的"这帧的 RTP 时间戳"），拿不到就说明这个浏览器或这条流测不了。 */
+function onFrame(meta) {
+  if (null === anchorRtpTs || !haveClockOffset || meta.rtpTimestamp == null) return;
+  // >>> 0 是 32 位无符号回绕：90kHz 下约 13 小时后时间戳会绕回，直接相减会得到
+  // 一个巨大的负数。
+  const dts = (meta.rtpTimestamp - anchorRtpTs) >>> 0;
+  const e2e = (Date.now() - clockOffsetMs) - (anchorMs + dts / 90);
+  if (e2e < -1000 || e2e > 60000) return;   // 锚点刚切换或时钟刚跳
+  e2eSamples.push(e2e);
+  if (e2eSamples.length > E2E_CAP) e2eSamples.shift();
+  const now = performance.now();
+  if (now - lastLatencyRender > 500) { lastLatencyRender = now; renderLatency(); }
+}
+
+function renderLatency() {
+  const rows = [];
+  const known = PHASE_ORDER.filter(n => phases.has(n));
+  if (known.length) {
+    rows.push(`<div class="stat">建连各阶段（performance.now 差，与 CLI connect_probe.mjs 同口径）</div>`);
+    let prev = 0;
+    known.forEach(n => {
+      const ms = phases.get(n);
+      const delta = ms - prev;
+      // 阶段之间可能倒挂：ICE 收集现在是后台跑的，完成时刻往往晚于信令；ontrack
+      // 也可能早于 connectionState 变 connected。负号要如实显示，所以不能用固定
+      // 的 "+" 前缀拼。
+      rows.push(m(n, `${delta >= 0 ? "+" : ""}${delta.toFixed(1)} ms　累计 ${ms.toFixed(1)} ms`));
+      prev = ms;
+    });
+    if (!known.includes("首帧解码")) {
+      rows.push(`<div class="stat">等待首帧出图…</div>`);
+    }
+    rows.push(`<div class="stat" style="margin-top:10px">接入→显示延迟（服务端锚点 + 本机 RVFC 的 rtpTimestamp，覆盖服务端/网络/播放缓冲）</div>`);
+  }
+  if (e2eSamples.length) {
+    const a = avg(e2eSamples);
+    rows.push(m("接入→显示 (均值/最小)", `${a.toFixed(1)} / ${Math.min(...e2eSamples).toFixed(1)} ms`));
+    rows.push(m("帧样本/本机时钟偏移", `${e2eSamples.length} / ${clockOffsetMs.toFixed(0)} ms`));
+    if (reportStatus) rows.push(m("回报服务端", reportStatus));
+  } else if (null === anchorRtpTs) {
+    rows.push(`<div class="stat">服务端未下发锚点：信令应答里没有 latency 字段（旧二进制），或还没有视频包。</div>`);
+  } else {
+    rows.push(`<div class="stat">已拿到锚点，等待可测的显示帧…</div>`);
+  }
+  // 采集→接入那一段只有推流端知道自己何时产出帧（RTMP 时间轴只有媒体时间，没有
+  // 墙钟），服务端锚不到。CLI 的 latency_probe.mjs 用 ffmpeg -progress 在推流机
+  // 上取到它，浏览器没有等价物，所以这里说明清楚而不是拿两段拼接冒充端到端。
+  if (null !== anchorRtpTs) {
+    rows.push(`<div class="stat" style="margin-top:8px">采集→接入（编码器到服务端）不含在内：只有推流端能提供，见 README 的 latency_probe.mjs。</div>`);
+  }
+  el.latency.innerHTML = rows.join("");
+}
+
+// requestVideoFrameCallback 是页面唯一能确认"这一帧真的送到了屏幕上"的信号，
+// 也是唯一能拿到该帧 rtpTimestamp 的地方 —— 后者只有 WebRTC 流才有。端到端延迟
+// 正是用它和服务端的采集锚点做差，所以这里既打首帧的点，也持续采样。
+let rvfcId = 0;
+let lastFrame = null;
+
+function watchFrames() {
+  if (typeof el.video.requestVideoFrameCallback !== "function") {
+    // 不支持 RVFC 的浏览器（Firefox）：退化成"收到视频轨"，端到端延迟测不了。
+    markPhase("首帧解码");
+    return;
+  }
+  const step = (now, meta) => {
+    markPhase("首帧解码");
+    lastFrame = meta;
+    onFrame(meta);
+    rvfcId = el.video.requestVideoFrameCallback(step);
+  };
+  rvfcId = el.video.requestVideoFrameCallback(step);
+}
+
 // 优先协商 H264 + Opus（其余 codec 不选）
 function preferCodecs(pc) {
   if (typeof RTCRtpSender === "undefined" || !RTCRtpSender.getCapabilities) return;
@@ -200,17 +342,23 @@ function wireEvents() {
     const s = pc.connectionState;
     log(`[${Date.now()-t0}ms] connectionState=${s}`);
     setBadge("cConn", s);
-    if (s === "connected") setState("已连接", "ok");
+    if (s === "connected") { markPhase("DTLS 连通"); setState("已连接", "ok"); }
     if (s === "failed") { setState("连接失败", "err"); fallback("connectionState=failed"); }
   };
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
     log(`[${Date.now()-t0}ms] iceState=${s}`);
     setBadge("cIce", s);
+    if (s === "connected" || s === "completed") markPhase("ICE 连通");
     if (s === "failed") fallback("iceConnectionState=failed");
   };
   pc.onsignalingstatechange = () => setBadge("cSig", pc.signalingState);
-  pc.onicegatheringstatechange = () => setBadge("cGather", pc.iceGatheringState);
+  pc.onicegatheringstatechange = () => {
+    setBadge("cGather", pc.iceGatheringState);
+    // 收集是后台跑的，完成时刻记进阶段表即可 —— 它不再挡在信令前面，所以这一行
+    // 出现在表里往往晚于"收到 answer"，那是并发而不是乱序。
+    if (pc.iceGatheringState === "complete") markPhase("ICE 收集完成");
+  };
 }
 
 async function play() {
@@ -222,8 +370,11 @@ async function play() {
   fellBack = false;
   curTarget = { app, stream, key: secret };
   fallbackTimer = setTimeout(() => fallback("超时未出图"), 10000);
-  const api = `http://${host}:18082/rtc/v1/play/`;
-  const streamurl = `webrtc://${host}:18082/${app}/${stream}`;
+  // 信令端口取页面自己的端口：页面和信令永远在同一个 server 上，写死 18082 会让
+  // 任何非默认部署（隔离实例、改了 listen 的现场）在打开页面后直接连错端口。
+  const sigPort = location.port || "18082";
+  const api = `http://${host}:${sigPort}/rtc/v1/play/`;
+  const streamurl = `webrtc://${host}:${sigPort}/${app}/${stream}`;
   log(`信令: POST ${api}`);
   log(`流: ${streamurl}`);
 
@@ -236,7 +387,12 @@ async function play() {
   };
 
   try {
+    tPhase = performance.now();
+    phases = new Map();
+    renderLatency();
+
     pc = new RTCPeerConnection();
+    markPhase("pc 创建");
     pc.addTransceiver("audio", { direction: "recvonly" });
     pc.addTransceiver("video", { direction: "recvonly" });
     preferCodecs(pc);
@@ -252,30 +408,49 @@ async function play() {
       if (kind === "video" && ev.streams[0]) {
         el.video.srcObject = ev.streams[0];
         el.video.play().catch(e => log("play(): " + e));
+        markPhase("首包 RTP");
+        watchFrames();
       }
     };
 
     const offer = await pc.createOffer();
+    markPhase("createOffer");
     await pc.setLocalDescription(offer);
-    // 等待本地候选收集完成（最多 2s），使 offer 含 host 候选
-    await new Promise(res => {
-      if (pc.iceGatheringState === "complete") return res();
-      const t = setTimeout(res, 2000);
-      pc.addEventListener("icegatheringstatechange", () => {
-        if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); }
-      });
-    });
+    markPhase("setLocalDescription");
+
+    // 不等本地候选收集完再发信令。
+    //
+    // 这里原本要等 iceGatheringState 变成 complete（最多 2 秒），为的是让 offer
+    // 带上 host 候选。但这个服务端是 ICE-lite：它只从 offer 里取 ice-ufrag 和
+    // ice-pwd，从不读 a=candidate，客户端的地址是它从第一个 STUN binding 请求的
+    // 源地址上直接取的。等待换不来任何东西，只换来一段白等——实测 155 ms，占出图
+    // 总时间的两成。
+    //
+    // 收集本身照常在后台跑（候选不会因此少收），完成时刻仍记进阶段表，见
+    // wireEvents 里的 icegatheringstatechange。
 
     el.btnPlay.disabled = true; el.btnStop.disabled = false;
     setState("信令协商中…", "warn");
 
     const tk = signToken(secret, app, stream, 3600);
+    markPhase("信令请求发出");
+    tSigSent = Date.now();
     const res = await fetch(api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sdp: offer.sdp, streamurl, api, t: String(tk.t), sign: tk.sign }),
     });
     const data = await res.json().catch(() => null);
+    markPhase("收到 answer");
+    if (data && data.latency) {
+      latencyInfo = data.latency;
+      anchorRtpTs = latencyInfo.anchor_rtp_ts;
+      anchorMs = latencyInfo.anchor_s * 1000 + latencyInfo.anchor_ms;
+      const serverNowMs = latencyInfo.now_s * 1000 + latencyInfo.now_ms;
+      // 取请求发出与应答到达的中点作为"服务端现在是几点"的估计，误差是半个单程。
+      clockOffsetMs = (tSigSent + Date.now()) / 2 - serverNowMs;
+      haveClockOffset = true;
+    }
     if (!data) {
       log(`信令返回非 JSON (HTTP ${res.status})`);
       if (res.status === 429) log("被限流：播放请求过于频繁，等几秒再试");
@@ -288,9 +463,17 @@ async function play() {
     if (data.code !== 0) { log("信令错误: " + JSON.stringify(data)); setState("信令失败 code=" + data.code, "err"); stop(); return; }
     log(`[${Date.now()-t0}ms] 收到 answer SDP`);
     await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    markPhase("answer 已应用");
+
+    // 本会话在服务端的身份。服务端是 ICE-lite，ufrag 由它自己生成并写进 answer，
+    // 页面读回来就能在回报时指名道姓。
+    const um = /a=ice-ufrag:([^\r\n]+)/.exec(data.sdp || "");
+    myUfrag = um ? um[1].trim() : null;
+    if (!myUfrag) log("answer 里没有 ice-ufrag，端到端延迟将无法回报");
 
     startStats();
     startServerStats(host);
+    startReport(host);
   } catch (e) {
     log("异常: " + e.message);
     setState("出错", "err");
@@ -323,6 +506,13 @@ function collectStats(stats) {
         k.height = s.frameHeight;
         k.nack = s.nackCount || 0;
         k.pli = s.pliCount || 0;
+        // 接收侧延迟的两个可测分量：帧在抖动缓冲里等多久，解码一帧要多久。
+        // 它们是"接入→显示"里属于浏览器的那部分，和 RVFC 测出的总数一起看，
+        // 就能分辨延迟是花在网络上还是花在播放器里。
+        k.jbMs = (s.jitterBufferEmittedCount > 0)
+          ? s.jitterBufferDelay / s.jitterBufferEmittedCount * 1000 : null;
+        k.decodeMs = (s.framesDecoded > 0)
+          ? s.totalDecodeTime / s.framesDecoded * 1000 : null;
         out.codecVideo = codecs[s.codecId] || "";
       } else {
         out.codecAudio = codecs[s.codecId] || "";
@@ -358,6 +548,8 @@ function startStats() {
       rows.push(m("视频码率", fmtKbps(vBps)));
       rows.push(m("视频丢包", st.video.lost + " / " + fmtPct(vLoss)));
       rows.push(m("视频抖动", fmtMs(st.video.jitter)));
+      rows.push(m("抖动缓冲延迟", fmtMs(st.video.jbMs == null ? null : st.video.jbMs / 1000)));
+      rows.push(m("解码耗时/帧", fmtMs(st.video.decodeMs == null ? null : st.video.decodeMs / 1000)));
       rows.push(m("视频解码/关键帧", st.video.frames + " / " + st.video.key));
       rows.push(m("视频 NACK/PLI", st.video.nack + " / " + st.video.pli));
       rows.push(m("视频编码", st.codecVideo || "—"));
@@ -374,9 +566,50 @@ function startStats() {
 
 function m(k, v) { return `<div class="metric"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
 
+// 回报本机测出的端到端延迟。/rtc/v1/report 是唯一一个普通浏览器能写的控制面端点，
+// 服务端按 IP 限流（2 r/s），所以这里固定 5 秒一次，不要缩短。
+function startReport(host) {
+  if (reportTimer) clearInterval(reportTimer);
+  const url = `http://${host}:${location.port || "18082"}/rtc/v1/report`;
+  const tick = async () => {
+    if (!pc || !myUfrag) return;
+    if (!e2eSamples.length) { reportStatus = "还没有可上报的样本（等首帧出图）"; renderLatency(); return; }
+    let st = null;
+    try { st = collectStats(await pc.getStats()); } catch (e) {}
+    const body = {
+      stream: curTarget ? `${curTarget.app}/${curTarget.stream}` : "",
+      ufrag: myUfrag,
+      e2e_ms: avg(e2eSamples),
+      e2e_min: Math.min(...e2eSamples),
+      frames: e2eSamples.length,
+    };
+    if (st) {
+      // 抖动缓冲与解码耗时是"接入→显示"里属于浏览器的两段，一起报上去，服务端
+      // 才能判断延迟是花在网络还是花在播放器里。
+      if (st.video.jbMs != null) body.jb_ms = st.video.jbMs;
+      if (st.video.decodeMs != null) body.decode_ms = st.video.decodeMs;
+      if (st.rtt != null) body.rtt_ms = st.rtt * 1000;
+    }
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      reportStatus = res.ok
+        ? `已上报 ${body.e2e_ms.toFixed(1)} ms（${body.frames} 帧样本）`
+        : `上报被拒 HTTP ${res.status}`;
+    } catch (e) {
+      reportStatus = `上报失败：${e.message}`;
+    }
+    renderLatency();
+  };
+  reportTimer = setInterval(tick, 5000);
+}
+
 function startServerStats(host) {
   if (serverTimer) clearInterval(serverTimer);
-  const url = `http://${host}:18082/rtc/v1/stats`;
+  const url = `http://${host}:${location.port || "18082"}/rtc/v1/stats`;
   const tick = async () => {
     try {
       const res = await fetch(url);
@@ -396,9 +629,19 @@ function renderServerStats(d) {
     el.serverStats.innerHTML = `<div class="stat">暂无活动流。</div>`;
     return;
   }
+  // 顺手刷新延迟锚点：服务端每 2 秒发一次 RTCP SR，锚点跟着更新，这里取最新那份。
+  // 不复用信令应答里那份是因为它停在发起播放那一刻，之后 SR 描述的才是当前活边。
+  if (curTarget) {
+    const want = `${curTarget.app}/${curTarget.stream}`;
+    const s = d.streams.find(x => x.name === want);
+    if (s && s.anchor && s.anchor.rtp_ts) {
+      anchorRtpTs = s.anchor.rtp_ts;
+      anchorMs = s.anchor.s * 1000 + s.anchor.ms;
+    }
+  }
   let html = `<table><thead><tr>
     <th>流</th><th>发布</th><th>观众</th>
-    <th>会话 TWCC(丢/收) · pacer · 丢弃(pacer/gop)</th>
+    <th>会话 TWCC(丢/收) · pacer · 丢弃(pacer/gop/静默) · RTT</th>
     <th>视频SSRC</th><th>PT</th><th>包</th><th>字节</th>
     <th>音频SSRC</th><th>PT</th><th>包</th><th>字节</th>
   </tr></thead><tbody>`;
@@ -406,12 +649,17 @@ function renderServerStats(d) {
     // pacer 目标码率与丢弃计数是区分"链路丢包"和"服务端自己丢包"的依据：
     // pacer 丢弃的包仍带 RTP 序号，接收端会把它算成丢包，丢包驱动的 AIMD 就会把
     // 自己的丢弃读成拥塞。pacer 掉到下限（64 kbps）而"弃"持续增长即为自锁。
+    // RTT 是服务端自己测的：它发 SR，客户端回的 RR 里带"我最后收到的是哪个 SR"以及
+    // "我压了多久才回"，相减就是这条路径的往返时延。0 表示还没有收到可用的 RR。
     const sess = (s.sessions || []).map(x =>
       `#${x.id} ${x.twcc_lost}/${x.twcc_received} · ${fmtKbps(x.pacer_bps)}` +
-      ` · 弃 ${x.drop_pacer || 0}/${x.drop_gop || 0}`).join("<br>");
+      ` · 弃 ${x.drop_pacer || 0}/${x.drop_gop || 0}/${x.drop_silent || 0}` +
+      ` · RTT ${x.rtt_ms ? x.rtt_ms + " ms" : "—"}`).join("<br>");
     const sessTitle = (s.sessions || []).map(x =>
       `#${x.id}: pacer 目标 ${fmtKbps(x.pacer_bps)}，` +
-      `pacer 丢弃 ${x.drop_pacer || 0} 包，等 IDR 丢弃 ${x.drop_gop || 0} 包`
+      `pacer 丢弃 ${x.drop_pacer || 0} 包，等 IDR 丢弃 ${x.drop_gop || 0} 包，` +
+      `静默停发 ${x.drop_silent || 0} 包（对端超过 rtc_silence_timeout 没说话），` +
+      `服务端实测往返 ${x.rtt_ms || 0} ms（单向约 ${((x.rtt_ms || 0) / 2).toFixed(1)} ms）`
     ).join("\n");
     html += `<tr>
       <td>${s.name}</td><td>${s.publishing ? "是" : "否"}</td><td>${s.clients}</td>
@@ -423,16 +671,35 @@ function renderServerStats(d) {
   html += `</tbody></table>`;
   html += `<div class="stat">流总数 ${d.total_streams} · 观众总数 ${d.total_clients} · ` +
           `视频字节 ${d.total_video_octets} · 音频字节 ${d.total_audio_octets}</div>`;
-  html += `<div class="stat">会话列：#id 丢/收 · pacer 目标 · 弃 pacer/等IDR。` +
+  html += `<div class="stat">会话列：#id 丢/收 · pacer 目标 · 弃 pacer/等IDR/静默 · RTT。` +
           `pacer 目标掉到 64 kbps 且"弃"持续增长 = 服务端自己在丢包（拥塞控制自锁），` +
-          `不是链路丢包。</div>`;
+          `不是链路丢包。"静默"是对端超过 rtc_silence_timeout 没说话后服务端主动停发的包数。` +
+          `RTT 是服务端自己测的往返时延（它发 SR，客户端回的 RR 里带"压了多久"，相减即得），` +
+          `与浏览器 getStats 的 RTT 是同一段路径的两个测点。</div>`;
   el.serverStats.innerHTML = html;
 }
 
 function stop() {
   if (statTimer) { clearInterval(statTimer); statTimer = null; }
   if (serverTimer) { clearInterval(serverTimer); serverTimer = null; }
+  if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
   if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+  if (rvfcId && el.video.cancelVideoFrameCallback) {
+    el.video.cancelVideoFrameCallback(rvfcId);
+  }
+  rvfcId = 0;
+  lastFrame = null;
+  tPhase = 0;
+  phases = new Map();
+  latencyInfo = null;
+  anchorRtpTs = null;
+  anchorMs = null;
+  clockOffsetMs = 0;
+  haveClockOffset = false;
+  e2eSamples.length = 0;
+  myUfrag = null;
+  reportStatus = "";
+  el.latency.innerHTML = `<div class="stat">等待播放…</div>`;
   lastBytes = { video: 0, audio: 0, ts: 0 };
   if (pc) {
     try { pc.getSenders().forEach(s => s.track && s.track.stop()); pc.close(); } catch (e) {}

@@ -189,9 +189,8 @@ const el = { video: $("video"), overlay: $("overlay"), ovText: $("ovText"), stat
              btnMute: $("btnMute"), btnFs: $("btnFs") };
 let player = null;
 let t0 = 0;                 // 本次播放起点 (ms)
-let firstFrame = 0;         // 首关键帧相对耗时 (ms)
+let firstFrame = 0;         // 出图相对耗时 (ms), 0 = 尚未出图
 let statTimer = null;
-let lastBytes = { v: 0, a: 0, ts: 0 };
 
 function log(m) {
   el.log.textContent += new Date().toISOString().slice(11, 19) + " " + m + "\n";
@@ -292,57 +291,65 @@ function stopServer() {
 
 function renderStats() {
   const st = player ? player.statisticsInfo : null;
+  const mi = player ? player.mediaInfo : null;
   const now = Date.now();
   const run = now - t0;
 
-  // 出图判据: 用 statisticsInfo.video.decodedFrames (由 _fillStatisticsInfo 从
-  // getVideoPlaybackQuality().totalVideoFrames 填充), 这是这个 flv.js 版本真正
-  // 会写的字段。此前读的是 firstVideoKeyFrameDecodedTime —— 那是 mpegts.js 的
-  // 字段, 这里的 flv.min.js 从不设置它, 于是整块永远是 falsy, 状态永远停在
-  // "连接中…"、统计表永远显示"等待视频帧…"。直播第一帧必然是 IDR, 所以
-  // "已有帧被解码"就等价于"已出图"。
+  // 出图判据: 这个 flv.min.js 的 statisticsInfo 是**平铺**的 ——
+  // _fillStatisticsInfo() 把 decodedFrames/droppedFrames 写在对象顶层(取自
+  // getVideoPlaybackQuality()), 没有 video/audio 子对象。此前这里读的
+  // firstVideoKeyFrameDecodedTime 和下面视频行读的 st.video.* 都是 mpegts.js
+  // 的形状(mpegts.js 用 video:{decoded,dropped,bytes}), 在这个构建里全是
+  // undefined, 于是状态永远停在"连接中…"、表格永远显示"等待视频帧…"。
+  // 打包产物里 _fillStatisticsInfo 的返回键已实测:
+  //   {speed, playerType, decodedFrames, droppedFrames}
+  // 直播第一帧必然是 IDR, 所以"已有帧被解码"等价于"已出图"。
   //
-  // 代价: 首帧耗时只能算到 now - t0, 精度取决于 renderStats 的调用间隔, 不再是
-  // flv.js 内部 performance 时间戳的毫秒级读数, 所以下面按秒取整、标签也据实改。
-  if (st && st.video && st.video.decodedFrames > 0 && !firstFrame) {
+  // 代价: 出图耗时只能算到 now - t0, 精度取决于本函数的调用间隔, 不再是 flv.js
+  // 内部 performance 时间戳的毫秒级读数, 所以按秒取整、标签据实改。
+  if (st && st.decodedFrames > 0 && !firstFrame) {
     firstFrame = Math.max(0, now - t0);
     log("出图: " + (firstFrame / 1000).toFixed(1) + " s");
     setState("已连接", "ok");
     el.overlay.style.display = "none";
   }
 
-  const vd = st && st.video ? st.video : {};
-  const ad = st && st.audio ? st.audio : {};
-  const vBps = lastBytes.ts && vd.bytes ? (vd.bytes - lastBytes.v) * 8 / ((now - lastBytes.ts) / 1000) : 0;
-  const aBps = lastBytes.ts && ad.bytes ? (ad.bytes - lastBytes.a) * 8 / ((now - lastBytes.ts) / 1000) : 0;
-  lastBytes = { v: vd.bytes || 0, a: ad.bytes || 0, ts: now };
+  const decoded = st ? st.decodedFrames : null;
+  const dropped = st ? st.droppedFrames : null;
+
+  // 缓冲年龄 = 与直播边缘的距离, 和下面的有界延迟保护同源。statisticsInfo 里
+  // 没有 mpegts.js 的 currentBufferLatency/currentBufferSize, 直接用 MSE 缓冲算。
+  let bufAge = null;
+  try {
+    const b = el.video.buffered;
+    if (b && b.length > 0) {
+      bufAge = b.end(b.length - 1) - el.video.currentTime;
+    }
+  } catch (e) { bufAge = null; }
 
   const w = el.video.videoWidth, h = el.video.videoHeight;
   if (w && h) {
-    el.bRes.textContent = fmtRes(w, h) + " " + (vd.fps ? vd.fps.toFixed(0) + "fps" : "");
+    el.bRes.textContent = fmtRes(w, h) + (mi && mi.fps ? " " + mi.fps.toFixed(0) + "fps" : "");
     el.vbadge.style.display = "flex";
   }
 
-  // 丢帧>0 是弱网信号(模块按 GOP 丢帧); 缓冲延迟小 = 实时
-  const dropCls = vd.dropped > 0 ? "loss" : "";
+  // 丢帧>0 是弱网信号(模块按 GOP 丢帧); 缓冲年龄小 = 贴着直播边缘
+  const dropCls = dropped > 0 ? "loss" : "";
   const rows = [];
   rows.push(row("已运行", (run / 1000).toFixed(1) + " s"));
-  // 秒级, 因为 firstFrame 只能算到 now - t0 (见上): fmtMs 会把它渲染成
-  // "1234 ms" 这种毫秒级读数, 精度对不上, 所以这一行自己格式化。
-  rows.push(row("出图画面前耗时", firstFrame == null ? "—" : (firstFrame / 1000).toFixed(1) + " s"));
+  // 秒级: firstFrame 只能算到 now - t0(见上), fmtMs 会把它渲染成 "1234 ms"
+  // 这种毫秒级读数, 精度对不上, 所以这一行自己格式化。
+  rows.push(row("出图画面前耗时", firstFrame ? (firstFrame / 1000).toFixed(1) + " s" : "—"));
   rows.push(row("下载速度", fmtKBps(st ? st.speed : null)));
-  rows.push(row("缓冲延迟(实时度)", st ? fmtMs(st.currentBufferLatency) : "—",
-                st && st.currentBufferLatency != null && st.currentBufferLatency < 400 ? "live" : ""));
-  rows.push(row("缓存时长", st ? fmtMs(st.currentBufferSize) : "—"));
-  rows.push(row("视频码率", fmtKBps(vBps / 8)));
-  rows.push(row("音频码率", fmtKBps(aBps / 8)));
-  rows.push(row("解码帧", vd.decoded != null ? vd.decoded : "—"));
-  rows.push(row("丢帧(弱网丢帧)", vd.dropped != null ? vd.dropped : "—", dropCls));
-  rows.push(row("已收视频/音频", (vd.bytes != null ? (vd.bytes / 1024).toFixed(0) + "/" : "—") +
-                (ad.bytes != null ? (ad.bytes / 1024).toFixed(0) + " KB" : "—")));
-  rows.push(row("视频/音频编码", (vd.codecType || "—") + " / " + (ad.codecType || "—")));
-  rows.push(row("解码状态", vd.decoded > 0 ? "✓ 已出图" : "等待视频帧…",
-                vd.decoded > 0 ? "live" : ""));
+  rows.push(row("缓冲年龄(直播边缘距离)", bufAge == null ? "—" : fmtMs(bufAge * 1000),
+                bufAge != null && bufAge < 0.4 ? "live" : ""));
+  // 码率/编码取自 mediaInfo(流头解析出的声明值), 不是实测, 故标签写明
+  rows.push(row("视频码率(声明)", mi && mi.videoDataRate ? fmtKBps(mi.videoDataRate / 8) : "—"));
+  rows.push(row("音频码率(声明)", mi && mi.audioDataRate ? fmtKBps(mi.audioDataRate / 8) : "—"));
+  rows.push(row("解码帧", decoded != null ? decoded : "—"));
+  rows.push(row("丢帧(弱网丢帧)", dropped != null ? dropped : "—", dropCls));
+  rows.push(row("视频/音频编码", ((mi && mi.videoCodec) || "—") + " / " + ((mi && mi.audioCodec) || "—")));
+  rows.push(row("解码状态", decoded > 0 ? "✓ 已出图" : "等待视频帧…", decoded > 0 ? "live" : ""));
 
   // 有界延迟保护: 一旦 MSE 缓冲年龄超过 2.5s(解码停滞时缓冲会无限积压,
   // 旧 flv.js 无 live-sync 不会自动跳到直播边缘), 就主动跳到直播边缘, 防止
@@ -410,7 +417,6 @@ function play() {
 
   t0 = Date.now();
   firstFrame = 0;
-  lastBytes = { v: 0, a: 0, ts: 0 };
   statTimer = setInterval(renderStats, 500);
   startServer();   // play() 先 stop() 清了 server 轮询, 这里重启
 }

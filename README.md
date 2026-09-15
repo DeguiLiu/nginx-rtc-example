@@ -30,7 +30,7 @@ vendor/                 dependency notes (no embedded source, except one runtime
 deploy/nginx/
   conf/                 nginx.conf + *.lua (HMAC auth, stats, flvplayer, viewer count)
   html/                 rtcplayer.html / flv.min.js (flv.js v1.6.2) / hmac-sha256.js
-client/                 play.mjs (play), whip_push.mjs (WHIP push), lib/token.mjs (HMAC)
+client/                 play.mjs (play), whip_push.mjs (WHIP push), latency_probe.mjs (latency), lib/token.mjs (HMAC)
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
 docs/                   design, evaluation, implementation guides, nginx coding standards (Chinese)
   images/               README screenshots
@@ -91,7 +91,7 @@ Prefix resolution: `OPENRESTY_PREFIX`, then `build/nginx`, else error. `run.sh n
 
 | Port | Purpose |
 |---|---|
-| 18082 HTTP | `/flvplayer`, `/rtcplayer.html`, `/rtc/v1/stats`, `/rtc/v1/flvcnt`, `/metrics` |
+| 18082 HTTP | `/flvplayer`, `/rtcplayer.html`, `/rtc/v1/stats`, `/rtc/v1/flvcnt`, `/rtc/v1/report`, `/metrics` |
 | 1935 RTMP | push ingest + HTTP-FLV source |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
@@ -111,6 +111,55 @@ Demo values: play `demo-secret-0123456789abcdef0123456789abcdef`, publish `push-
 ### Player fallback
 
 `rtcplayer.html` redirects to `/flvplayer?app=&stream=&key=` (same target prefilled) when WebRTC `connectionState`/`iceConnectionState` hits `failed`, or when no media arrives within 10 s.
+
+## Latency
+
+Steady-state end-to-end latency: the wall-clock gap between the source encoder handing a frame to the muxer and the player holding that frame's last RTP packet. Measured on one machine, headless werift player, 25 s window (683 frames per run, repeated).
+
+| Push | p50 | p90 | p99 |
+|---|---|---|---|
+| audio input unpaced (before the fix) | 173 ms | 217 ms | 239 ms |
+| audio input paced (after the fix) | **45 ms** | 57 ms | 68 ms |
+| no audio input (control) | 18 ms | 31 ms | 35 ms |
+| production 640x360 push, paced | 48 ms | 60 ms | 68 ms |
+
+The fix was one line in `run.sh`: `-re` is a *per-input* ffmpeg option, and pacing only the video input left the sine source free to generate samples at full speed, which held video back ~128 ms inside ffmpeg. The RTC leg was never involved — an RTCP sender report places it at ~0 ms either way.
+
+This is the steady-state figure, not startup. Connection setup — ICE/DTLS plus waiting for the first IDR — is a separate and much larger number (476–560 ms, see `docs/测试文档.md`).
+
+### How it is measured
+
+```mermaid
+flowchart LR
+    A["ffmpeg push<br/>-progress out_time_us"] -->|"anchor: media time ↔ wall clock"| B["media time m"]
+    C["player RTP packet<br/>rtp_ts"] -->|"rtp_ts / 90"| B
+    B --> D["latency = arrival − anchor(m)"]
+
+    classDef src fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef mid fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef out fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    class A,C src
+    class B mid
+    class D out
+```
+
+Everything runs on one machine, so a single wall clock covers the whole path. `client/latency_probe.mjs` records every video RTP packet's arrival time and timestamp, groups packets into frames, and takes the **last** packet of a frame as the moment it becomes decodable. Two details carry the method:
+
+- **RTP timestamp → media milliseconds is exact.** The module maps RTMP milliseconds with `ms × 90` and never rebases, so a received timestamp folds straight back onto the encoder's own output clock; the module's `avsync` log asserts the skew is 0 ms.
+- **The first 2 s of a subscription are excluded** (`--warmup`, default 2000 ms). The module replays the current GOP to a joining viewer, so those frames arrive far behind the live edge and would otherwise be reported as tens of seconds of latency. They are counted and reported separately rather than dropped silently.
+
+```bash
+node client/latency_probe.mjs --anchor /tmp/rtc_anchor.txt --duration 25000
+node client/latency_probe.mjs --anchor /tmp/rtc_anchor.txt --raw   # per-frame columns
+```
+
+The anchor file is a timestamped capture of the pusher's `-progress` output. The probe also subscribes to RTCP sender reports and uses them as a second anchor that does not depend on ffmpeg — that is what pins the source→server and server→client split.
+
+### What these numbers are not
+
+They are for attribution, not for acceptance. Loopback has no RTT, no loss, no congestion; the werift player has no jitter buffer where a browser adds 100–300 ms; and `-progress` itself reports 25–46 ms late, so every figure above **understates** the true latency by roughly that much. The 45 ms is a reproducible lower bound for same-condition A/B work, not a user-perceived latency claim.
+
+Full method, the experiments that ruled out the alternative explanations, and the limits: `docs/延迟测量方法与数据.md`.
 
 ## Testing
 

@@ -19,3 +19,6 @@ node_modules/
 html/hls/
 html/dash/
 .DS_Store
+
+# Isolated git worktrees (see docs / using-git-worktrees)
+.worktrees/

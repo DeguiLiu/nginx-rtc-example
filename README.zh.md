@@ -31,7 +31,7 @@ vendor/                 依赖说明（不内嵌源码，唯一内嵌三方资�
 deploy/nginx/
   conf/                 nginx.conf + *.lua（HMAC 鉴权、stats、flvplayer、观众计数）
   html/                 rtcplayer.html / flv.min.js（flv.js v1.6.2）/ hmac-sha256.js
-client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）、lib/token.mjs（HMAC）
+client/                 play.mjs（播放）、whip_push.mjs（WHIP 推流）、latency_probe.mjs（延迟测量）、lib/token.mjs（HMAC）
 scripts/                fetch-deps.sh / build-deps.sh / build-openresty.sh
 docs/                   架构、详细设计、多 worker shm 设计、编译、测试、部署侧规范（中文）
   images/               README 截图
@@ -91,7 +91,7 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 
 | 端口 | 用途 |
 |---|---|
-| 18082 HTTP | `/flvplayer`、`/rtcplayer.html`、`/rtc/v1/stats`、`/rtc/v1/flvcnt`、`/metrics` |
+| 18082 HTTP | `/flvplayer`、`/rtcplayer.html`、`/rtc/v1/stats`、`/rtc/v1/flvcnt`、`/rtc/v1/report`、`/metrics` |
 | 1935 RTMP | 推流 + HTTP-FLV 源 |
 | 8000 UDP | WebRTC SRTP/SRTCP + ICE/STUN |
 
@@ -111,6 +111,55 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 ### 播放器降级
 
 `rtcplayer.html` 在 WebRTC `connectionState`/`iceConnectionState` 进入 `failed`，或 10 秒内没收到媒体时，自动跳 `/flvplayer?app=&stream=&key=`（同目标预填），弱网或连接失败时仍能播。
+
+## 延迟
+
+稳态端到端延迟，定义为「源端编码器把某一帧交给 muxer 的墙上时刻」到「播放端收到该帧最后一个 RTP 包的墙上时刻」。单机测得，werift 无头播放端，窗口 25 秒（每次 683 帧，重复多次）。
+
+| 推流 | p50 | p90 | p99 |
+|---|---|---|---|
+| 音频输入未节流（修复前） | 173 ms | 217 ms | 239 ms |
+| 音频输入加 `-re`（修复后） | **45 ms** | 57 ms | 68 ms |
+| 去掉音频输入（对照） | 18 ms | 31 ms | 35 ms |
+| 生产 640x360 推流，修复后 | 48 ms | 60 ms | 68 ms |
+
+改动只有 `run.sh` 里的一行：`-re` 是**逐输入**的 ffmpeg 选项，原来只节流了视频输入，第二个 `sine` 音频源得以全速产样，把视频在 ffmpeg 内部压后了约 128 ms。RTC 那一段始终无辜——RTCP sender report 显示它在两种情况下都约 0 ms。
+
+注意这是**稳态**数字，不是启动延迟。建连（ICE/DTLS 加等首个 IDR）是另一个量级更大的数字，实测 476~560 ms，见 `docs/测试文档.md`。
+
+### 测量方法
+
+```mermaid
+flowchart LR
+    A["ffmpeg 推流<br/>-progress out_time_us"] -->|"锚点: media time ↔ 墙上时钟"| B["media time m"]
+    C["播放端 RTP 包<br/>rtp_ts"] -->|"rtp_ts / 90"| B
+    B --> D["延迟 = 收包墙上时刻 − 锚点(m)"]
+
+    classDef src fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef mid fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef out fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    class A,C src
+    class B mid
+    class D out
+```
+
+所有进程在同一台机器上，一个墙上时钟覆盖全链路。`client/latency_probe.mjs` 记录每个视频 RTP 包的到达时刻与时间戳，按时间戳聚合成帧，取**该帧最后一个包**的到达时刻作为「可解码」时刻。方法成立靠两点：
+
+- **RTP 时间戳到 media 毫秒是精确的。** 模块按 `ms × 90` 映射 RTMP 毫秒且从不重基，收到的包时间戳可以直接折回编码器自己的出帧时钟；模块的 `avsync` 日志显示偏移恒为 0 ms。
+- **订阅最初 2 秒被排除**（`--warmup`，默认 2000 ms）。模块会向新加入的观看者回放当前 GOP，这些帧远落后于直播沿，不排除就会报成几十秒的延迟。它们被单独计数上报，而不是静默丢弃。
+
+```bash
+node client/latency_probe.mjs --anchor /tmp/rtc_anchor.txt --duration 25000
+node client/latency_probe.mjs --anchor /tmp/rtc_anchor.txt --raw   # 逐帧四列
+```
+
+锚点文件是推流端 `-progress` 输出的带时刻捕获。探针同时订阅 RTCP sender report，用一份不依赖 ffmpeg 的第二锚点——源端→服务端、服务端→播放端的分段就是靠它拆的。
+
+### 这些数字不能当什么用
+
+**可用于归因，不可用于验收。** 回环链路没有 RTT、没有丢包与拥塞；werift 播放端没有 jitter buffer，而真实浏览器会再叠加 100~300 ms；`-progress` 自身还滞后 25~46 ms，所以上表每个数字都**偏低**同样的量级。45 ms 是便于同条件 A/B 的复现下界，不是用户感知延迟。
+
+完整方法、排除备选解释的对照实验与口径局限见 `docs/延迟测量方法与数据.md`。
 
 ## 测试
 
