@@ -112,6 +112,8 @@ Demo values: play `demo-secret-0123456789abcdef0123456789abcdef`, publish `push-
 
 `rtcplayer.html` redirects to `/flvplayer?app=&stream=&key=` (same target prefilled) when WebRTC `connectionState`/`iceConnectionState` hits `failed`, or when no media arrives within 10 s.
 
+`/flvplayer` is configured for this product's pure-video streams (`hasAudio: false`, `stashInitialSize: 32768`): a stream with no audio track never reaches the first dispatch under the default 384 KB stash. If the stream gains an audio track, set `hasAudio` back to `true` — see the comments in `deploy/nginx/conf/flvplayer.lua`.
+
 ## Latency
 
 Steady-state end-to-end latency: the wall-clock gap between the source encoder handing a frame to the muxer and the player holding that frame's last RTP packet. Measured on one machine, headless werift player, 25 s window (683 frames per run, repeated).

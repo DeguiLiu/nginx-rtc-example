@@ -112,6 +112,8 @@ OPENRESTY_PREFIX=/path/to/nginx-prefix ./run.sh nginx   # sync 配置 + 启动
 
 `rtcplayer.html` 在 WebRTC `connectionState`/`iceConnectionState` 进入 `failed`，或 10 秒内没收到媒体时，自动跳 `/flvplayer?app=&stream=&key=`（同目标预填），弱网或连接失败时仍能播。
 
+`/flvplayer` 按**纯视频流**配置（`hasAudio: false`、`stashInitialSize: 32768`）：没有音轨的流在默认 384 KB 的首次 stash 阈值下等不到第一次 dispatch；流一旦加回音轨，`hasAudio` 要改回 `true`。理由见 `deploy/nginx/conf/flvplayer.lua` 的注释。
+
 ## 延迟
 
 稳态端到端延迟，定义为「源端编码器把某一帧交给 muxer 的墙上时刻」到「播放端收到该帧最后一个 RTP 包的墙上时刻」。单机测得，werift 无头播放端，窗口 25 秒（每次 683 帧，重复多次）。
