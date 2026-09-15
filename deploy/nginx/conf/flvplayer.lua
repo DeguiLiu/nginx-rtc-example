@@ -394,8 +394,21 @@ function play() {
   // Smooth-first: let MSE buffer absorb browser/network micro-jitter instead of
   // the old zero-stash (enableStashBuffer:false) config that re-buffered on any
   // hiccup and showed the spinner. Costs ~sub-second latency.
+  //
+  // 纯视频流(V1: 没有音轨)在 Windows/Edge 上的实测矩阵 —— 同一页面、同一路
+  // 2 Mbps 纯视频流、同一服务端、判据 readyState>=2 && videoWidth>0:
+  //   hasAudio:true  + 默认 stash(384 KB)    -> 22 s 内零 appendBuffer, 不出画
+  //   hasAudio:false + 默认 stash            -> 同样不出画
+  //   hasAudio:true  + enableStashBuffer:false -> 同样不出画
+  //   hasAudio:false + enableStashBuffer:false -> 出画 553 ms
+  //   hasAudio:false + stashInitialSize:32768  -> 出画 536 ms  <= 采用这一组
+  // 结论: hasAudio 要如实反映"这一路没有音轨", 同时首次 stash 阈值不能是默认的
+  // 384 KB, 否则纯视频流在 Windows 上永远等不到第一次 dispatch。保留
+  // enableStashBuffer 是为了留住抗抖动能力, 只把首次阈值降到 32 KB。
+  // 若产品流将来加了音轨, hasAudio 需一并改回 true。
   player = flvjs.createPlayer({ type: "flv", url: url, isLive: true,
-                                hasAudio: true, hasVideo: true, enableStashBuffer: true });
+                                hasAudio: false, hasVideo: true, enableStashBuffer: true,
+                                stashInitialSize: 32768 });
   player.on(flvjs.Events.ERROR, function (type, detail) {
     const info = detail && detail.info ? detail.info.code + " " + (detail.info.msg || "") : JSON.stringify(detail);
     log("ERROR [" + type + "] " + info);
