@@ -40,6 +40,8 @@ PUSH_KEY="${PUSH_KEY:-push-secret-9f8e7d6c5b4a39281706f5e4d3c2b1a0}"
 PLAY_KEY="${PLAY_KEY:-demo-secret-0123456789abcdef0123456789abcdef}"
 KEEP_PID=/tmp/rtc_keep_push.pid   # pid of keep-push supervisor, for stop()
 KEEP_TC_PID=/tmp/rtc_keep_tc.pid  # pid of keep-transcode supervisor, for stop()
+TC_MARK=rtc-transcode-marker      # argv[0] of the transcode ffmpeg
+PUSH_MARK=rtc-push-marker         # argv[0] of the push ffmpeg
 
 # Multi-resolution ladder (srs-demo parity): source stays untouched, each
 # rung is an independent RTMP stream transcoded from the source loopback.
@@ -150,13 +152,13 @@ start_push() {
     # output clock to the player: p50 173 ms unpaced vs 44 ms paced, against
     # 18 ms for a video-only push. The RTC leg is not involved -- an RTCP
     # sender report places it at ~0 ms either way.
-    TZ=Asia/Shanghai ffmpeg -re -f lavfi -i testsrc2=size=640x360:rate=30 \
+    ( TZ=Asia/Shanghai exec -a "$PUSH_MARK" ffmpeg -re -f lavfi -i testsrc2=size=640x360:rate=30 \
         -re -f lavfi -i sine=frequency=1000:sample_rate=48000 \
         -vf "$vf_clk" \
         -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -bf 0 -pix_fmt yuv420p \
         -maxrate 2500k -bufsize 1000k \
         -c:a aac -b:a 64k -ar 48000 \
-        -f flv "rtmp://127.0.0.1:1935/live/livestream?t=${exp}&sign=${sign}"
+        -f flv "rtmp://127.0.0.1:1935/live/livestream?t=${exp}&sign=${sign}" )
 }
 
 # Transcode the source stream into each ladder rung. One ffmpeg, N outputs:
@@ -199,24 +201,28 @@ start_transcode() {
     ffmpeg "${args[@]}"
 }
 
-# `pgrep -x ffmpeg` matches the TRANSCODE ffmpeg too -- `exec -a` rewrites
-# argv[0] but not /proc/<pid>/comm -- so keep-push concluded "an ffmpeg is
-# alive" and never respawned a dead push. Identify the push by the cmdline of
-# an actual ffmpeg process instead.
+# Identify the push by its own argv[0], the way the transcode already is.
+#
+# Anything weaker reaches across instances. `pgrep -x ffmpeg` was the first
+# version, and it matched the transcode ffmpeg (`exec -a` rewrites argv[0] but
+# not /proc/<pid>/comm, which pgrep -x reads). Matching on the cmdline's
+# content fixed that one case and left the general one: any other instance or
+# test publisher running the same demo source also carries argv[0] ffmpeg and
+# "testsrc2" in its cmdline, so this supervisor read a *neighbour's* publisher
+# as its own, never respawned its own dead one, and the stream silently stayed
+# down. /proc/<pid>/comm cannot see argv[0] at all, so the marker is also the
+# only thing that survives a neighbour with an identical command line.
+#
+# The pattern is anchored: an unanchored match also hits the shell whose own
+# command line mentions it, which is how a cleanup step kills its own caller.
 push_running() {
-    local p
-    for p in $(pgrep -x ffmpeg); do
-        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "testsrc2"; then
-            return 0
-        fi
-    done
-    return 1
+    pgrep -f "^${PUSH_MARK}" >/dev/null 2>&1
 }
 
 keep_push() {
     echo "[keep-push] supervising ffmpeg push (pid $$)"
     echo "$$" > "$KEEP_PID"
-    trap 'rm -f "$KEEP_PID"; pkill -x ffmpeg 2>/dev/null || true' EXIT
+    trap 'rm -f "$KEEP_PID"; pkill -f "^${PUSH_MARK}" 2>/dev/null || true' EXIT
     while true; do
         if ! push_running; then
             start_push || true
@@ -336,10 +342,13 @@ stop_supervisor() {   # name pidfile
 stop() {
     stop_supervisor keep-push "$KEEP_PID"
     stop_supervisor keep-transcode "$KEEP_TC_PID"
-    pkill -f "rtc-transcode-marker" 2>/dev/null || true
+    pkill -f "^${TC_MARK}" 2>/dev/null || true
     gen_nginx_conf 2>/dev/null || true
     "$ORX/sbin/nginx" -s stop -p "$ORX" -c conf/nginx.rtc.conf 2>/dev/null || true
-    pkill -x ffmpeg 2>/dev/null || true
+    # The push is matched by its marker, not by `pkill -x ffmpeg`: this prefix
+    # is not the only thing on the host running ffmpeg, and -x reaches every
+    # one of them (another instance's publisher, another session's capture).
+    pkill -f "^${PUSH_MARK}" 2>/dev/null || true
 }
 
 case "${1:-}" in
